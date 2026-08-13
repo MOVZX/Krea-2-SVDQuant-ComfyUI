@@ -42,8 +42,11 @@ import importlib.util
 import json
 import math
 import os
+import subprocess
 import sys
 import time
+import urllib.request
+import urllib.error
 
 __version__ = "0.2.0"
 
@@ -106,6 +109,83 @@ LAYER_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
 # in/out feature counts from the live nn.Linear, which isn't recoverable from the
 # checkpoint alone, so those are rejected instead.
 _DEQUANTIZABLE_FORMATS = ("float8_e4m3fn", "float8_e5m2")
+
+
+def _MIN_SOURCE_BYTES() -> int:
+    return 20 * 1024 ** 3
+
+
+def _free_comfyui_memory() -> None:
+    """Tell ComfyUI to unload models and free GPU memory."""
+    # Try common ComfyUI ports
+    for port in (8188, 8189, 8190):
+        try:
+            data = json.dumps({"unload_models": True, "free_memory": True}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/free",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    print(f"ComfyUI (port {port}): models unloaded, memory freed.")
+                    return
+        except (urllib.error.URLError, ConnectionRefusedError, OSError):
+            continue
+    print("warning: could not reach ComfyUI to unload models. GPU memory may be limited.")
+
+
+def _select_model() -> str:
+    """Interactive model selector: list eligible models, return full path."""
+    comfy_root = _find_comfyui_root()
+    if not comfy_root:
+        raise SystemExit("Cannot find ComfyUI root. Set COMFYUI_PATH or run from inside ComfyUI.")
+
+    models_dir = os.path.join(comfy_root, "models", "diffusion_models", "Krea-2")
+    if not os.path.isdir(models_dir):
+        raise SystemExit("Krea-2 models directory not found: {}".format(models_dir))
+
+    svdquant_dir = os.path.join(models_dir, "SVDQuant")
+    quantized_stems = set()
+    if os.path.isdir(svdquant_dir):
+        quantized_stems = {
+            os.path.splitext(n)[0]
+            for n in os.listdir(svdquant_dir)
+            if n.endswith(".safetensors")
+        }
+
+    candidates = []
+    for f in os.listdir(models_dir):
+        if not f.endswith(".safetensors"):
+            continue
+        full = os.path.join(models_dir, f)
+        if not os.path.isfile(full):
+            continue
+        if os.path.getsize(full) < _MIN_SOURCE_BYTES():
+            continue
+        stem = os.path.splitext(f)[0]
+        if any(qs.startswith(stem + "-") for qs in quantized_stems):
+            continue
+        candidates.append(full)
+
+    if not candidates:
+        raise SystemExit("No eligible models found (>20GB, not yet quantized).")
+
+    print("Available models:")
+    for i, path in enumerate(candidates, 1):
+        size_gb = os.path.getsize(path) / 1024 ** 3
+        print("  {}. {} ({:.1f} GB)".format(i, os.path.basename(path), size_gb))
+
+    while True:
+        choice = input("Select model (number): ").strip()
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(candidates):
+                return candidates[idx]
+        except ValueError:
+            pass
+        print("Invalid choice. Pick 1-{}.".format(len(candidates)))
 
 
 def detect_prefix(keys, default: str | None = None) -> str:
@@ -766,12 +846,13 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("src")
-    ap.add_argument("--format", choices=["int8", "w4a4", "svdq", "fp8"], default="int8",
+    ap.add_argument("src", nargs="?", default=None,
+                    help="Source model path (omit to select interactively)")
+    ap.add_argument("--format", choices=["int8", "w4a4", "svdq", "fp8"], default="svdq",
                     help="svdq = w4a4 residual + SVDQuant low-rank bf16 branch; "
                          "fp8 = float8_e4m3fn, no convrot, no low-rank branch")
     ap.add_argument("--groupsize", type=int, default=256, help="unused for fp8")
-    ap.add_argument("--rank", type=int, default=64, help="low-rank branch budget, svdq only")
+    ap.add_argument("--rank", type=int, default=256, help="low-rank branch budget, svdq only")
     ap.add_argument("--rank-alloc", choices=sorted(RANK_ALLOCATIONS), default="uniform",
                     help="how to spread the rank budget across the eight projection types. "
                          "uniform = same rank everywhere. gqa = byte-neutral reallocation "
@@ -788,7 +869,7 @@ def main():
                          "= 0.1%%). Lower means more iterations for less return: 0.001 takes "
                          "~22 iterations per layer, 0.005 takes ~9 for 2%% more error, and 0 "
                          "restores the old behaviour of running nearly all --refine-iters")
-    ap.add_argument("--variant", choices=["turbo", "base", "unknown"], default="unknown",
+    ap.add_argument("--variant", choices=["turbo", "base", "unknown"], default="turbo",
                     help="which Krea 2 release this is. Only affects the output filename "
                          "and the recorded metadata -- quantization is identical for both, "
                          "the difference is the sampler settings you run afterwards")
@@ -802,12 +883,34 @@ def main():
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
+    if args.src is None:
+        args.src = _select_model()
+
+    # Free GPU memory from any running ComfyUI session
+    _free_comfyui_memory()
+
     if args.act_stats:
         if args.format != "svdq":
             raise SystemExit("--act-stats only applies to format 'svdq': it weights the "
                              "low-rank split, and the other formats have no branch")
         if not os.path.exists(args.act_stats):
             raise SystemExit("--act-stats file not found: {}".format(args.act_stats))
+    else:
+        # Auto-detect: {source_name}_act_stats.safetensors di ComfyUI/output/
+        derived = os.path.splitext(os.path.basename(args.src))[0] + "_act_stats.safetensors"
+        comfy_root = _find_comfyui_root()
+        if comfy_root:
+            candidate = os.path.join(comfy_root, "output", derived)
+            if os.path.isfile(candidate):
+                args.act_stats = candidate
+
+    if not args.act_stats:
+        stem = os.path.splitext(os.path.basename(args.src))[0]
+        expected = stem + "_act_stats.safetensors"
+        raise SystemExit(
+            f"act_stats file not found: {expected}\n"
+            f"Run the Krea2 SVDQuant Capture nodes first to generate it."
+        )
 
     # RuntimeError is the shared failure type (see `convert`); the CLI wants SystemExit so it
     # prints one clean line instead of a traceback.
@@ -826,10 +929,21 @@ def main():
                                     args.act_stats)
         if note:
             print(note, flush=True)
+
+    def cli_progress(done, total, message):
+        pct = done / total * 100 if total else 0
+        bar_len = 30
+        filled = int(bar_len * done / total) if total else 0
+        bar = "█" * filled + "░" * (bar_len - filled)
+        sys.stdout.write(f"\r[{bar}] {done}/{total} ({pct:.0f}%) {message}")
+        sys.stdout.flush()
+        if done >= total:
+            sys.stdout.write("\n")
+
     try:
         convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
                 variant=args.variant, rank_alloc=args.rank_alloc, act_stats=args.act_stats,
-                refine_tol=args.refine_tol)
+                refine_tol=args.refine_tol, progress_cb=cli_progress)
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
 
