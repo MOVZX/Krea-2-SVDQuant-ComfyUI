@@ -36,6 +36,7 @@ from .svdquant_diag import _CATEGORY
 # layer name -> {"sumsq": float64 [in_features] on cpu, "count": int}
 _STATS: dict[str, dict] = {}
 _HANDLES: list = []
+_SOURCE_MODEL_STEM: str = ""
 # Checked first inside every hook, so a hook that outlives its handle is inert rather than
 # quietly accumulating. A leaked hook is the worst failure this module has: it would keep
 # adding activations from later, unrelated generations into _STATS, and the next calibration
@@ -173,7 +174,7 @@ class Krea2SVDQuantCaptureStart:
                                                "from a quantized model describe the "
                                                "quantized model's activations, which is the "
                                                "thing being corrected."}),
-                "reset": ("BOOLEAN", {"default": True,
+                "reset": ("BOOLEAN", {"default": False,
                                       "tooltip": "Clear anything gathered so far. Leave it "
                                                  "off to accumulate across several prompts, "
                                                  "which is the point of calibrating."}),
@@ -197,8 +198,12 @@ class Krea2SVDQuantCaptureStart:
         return float("nan")
 
     def start(self, model, reset):
+        global _SOURCE_MODEL_STEM
         if reset:
             _STATS.clear()
+        init = getattr(model, "cached_patcher_init", None)
+        if init and len(init) >= 2:
+            _SOURCE_MODEL_STEM = os.path.splitext(os.path.basename(init[1][0]))[0]
         attached = attach(model.model.diffusion_model)
         if attached == 0:
             raise RuntimeError(
@@ -219,9 +224,12 @@ class Krea2SVDQuantCaptureSave:
                 "latent": ("LATENT", {"tooltip": "Wire the KSampler's output here. This is "
                                                  "what forces the node to run *after* "
                                                  "sampling rather than before it."}),
-                "filename": ("STRING", {"default": "krea2_act_stats.safetensors",
-                                        "tooltip": "Written under ComfyUI/output/."}),
-                "keep_capturing": ("BOOLEAN", {"default": False,
+                "filename": ("STRING", {"default": "",
+                                        "tooltip": "Filename written under ComfyUI/output/. "
+                                                   "Leave empty to auto-derive from the model "
+                                                   "loaded in Capture Start "
+                                                   "(e.g. Beauty_Model_v10_act_stats.safetensors)."}),
+                "keep_capturing": ("BOOLEAN", {"default": True,
                                                "tooltip": "Leave the hooks attached so the "
                                                           "next queued prompt keeps adding "
                                                           "to the same statistics."}),
@@ -243,6 +251,10 @@ class Krea2SVDQuantCaptureSave:
         return float("nan")
 
     def save(self, latent, filename, keep_capturing):
+        if not filename.strip() and _SOURCE_MODEL_STEM:
+            filename = _SOURCE_MODEL_STEM + "_act_stats.safetensors"
+        elif not filename.strip():
+            filename = "krea2_act_stats.safetensors"
         path = os.path.join(folder_paths.get_output_directory(), filename)
         info = write(path)
         if not keep_capturing:

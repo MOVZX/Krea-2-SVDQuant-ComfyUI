@@ -58,7 +58,7 @@ class Krea2SVDQuantQuantize:
                                "option and still ~2x fp8 on Ampere. fp8: storage only.",
                 }),
                 "rank": ("INT", {
-                    "default": 64, "min": 8, "max": 1024, "step": 8,
+                    "default": 256, "min": 8, "max": 1024, "step": 8,
                     "tooltip": "svdq only: size of the low-rank branch. Only pays off with "
                                "refine_iters > 0. Without a LoRA, 64 / 128 / 256 measure the "
                                "same, so 64 is enough. With a LoRA loaded, 256 wins clearly "
@@ -89,7 +89,7 @@ class Krea2SVDQuantQuantize:
                     "tooltip": "convrot rotation group size. Unused for fp8.",
                 }),
                 "variant": (["turbo", "base", "unknown"], {
-                    "default": "unknown",
+                    "default": "turbo",
                     "tooltip": "Which Krea 2 release this is. Affects only the output "
                                "filename and the recorded metadata - quantization is "
                                "identical; what differs is the sampler settings afterwards.",
@@ -97,10 +97,10 @@ class Krea2SVDQuantQuantize:
                 "output_name": ("STRING", {
                     "default": "",
                     "tooltip": "Filename inside models/diffusion_models/. Leave empty to "
-                               "derive it from the variant and format.",
+                               "derive it from the source model name and format.",
                 }),
                 "overwrite": ("BOOLEAN", {
-                    "default": False,
+                    "default": True,
                     "tooltip": "Off means an existing file of the same name is an error "
                                "rather than 8 GB written over your last run.",
                 }),
@@ -114,7 +114,8 @@ class Krea2SVDQuantQuantize:
                                "Fits the low-rank branch against measured per-channel "
                                "activation energy instead of assuming it is uniform. Free at "
                                "inference and the best-measured setting here - LPIPS to BF16 "
-                               "0.3378 to 0.2825 with no LoRA. Empty means the plain objective.",
+                               "0.3378 to 0.2825 with no LoRA. Leave empty to auto-detect "
+                               "{source_name}_act_stats.safetensors in ComfyUI/output/.",
                 }),
             },
         }
@@ -149,7 +150,12 @@ class Krea2SVDQuantQuantize:
 
         # Same validation the CLI does for --act-stats: a typed path that silently did nothing
         # would produce a checkpoint indistinguishable from a plain one.
-        stats_path = act_stats.strip() or None
+        stats_path = act_stats.strip()
+        if not stats_path:
+            # Auto-derive from source model name: Beauty_Model_v10 → Beauty_Model_v10_act_stats.safetensors
+            derived = os.path.splitext(os.path.basename(src))[0] + "_act_stats.safetensors"
+            derived_full = os.path.join(folder_paths.get_output_directory(), derived)
+            stats_path = derived_full if os.path.isfile(derived_full) else None
         if stats_path is not None:
             if format != "svdq":
                 raise RuntimeError("act_stats only applies to format 'svdq': it weights the "
@@ -163,7 +169,7 @@ class Krea2SVDQuantQuantize:
             name = output_name.strip()
             if not name.endswith(".safetensors"):
                 name += ".safetensors"
-            dst = os.path.join(os.path.dirname(src), name)
+            dst = os.path.join(os.path.dirname(src), "SVDQuant", name)
         else:
             dst, note = derive_out_path(src, format, rank, variant, rank_alloc, stats_path)
             if note:
@@ -173,6 +179,8 @@ class Krea2SVDQuantQuantize:
             raise RuntimeError(
                 "{} already exists. Enable 'overwrite', or set a different output_name."
                 .format(dst))
+
+        os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
 
         free = _free_bytes(dst)
         if free < _MIN_FREE_BYTES:

@@ -749,9 +749,7 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
     """The default output path, plus a note to show when the source name is uninformative."""
     stem = os.path.splitext(os.path.basename(src))[0]
     note = None
-    if variant != "unknown":
-        stem = "Krea2-{}".format(variant.capitalize())
-    elif stem.lower() in _GENERIC_STEMS:
+    if stem.lower() in _GENERIC_STEMS:
         note = ("note: '{}' is a generic filename. Set the variant (or an explicit output "
                 "name) to get a checkpoint name you will still recognise next month."
                 .format(stem))
@@ -763,7 +761,7 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
     act_tag = "-actaware" if act_stats else ""
     suffix = ("SVDQuant-W4A4-rank{}{}{}".format(rank, alloc_tag, act_tag) if rank else
               ("{}-convrot".format(fmt_name.upper()) if fmt_name != "fp8" else "FP8"))
-    return os.path.join(os.path.dirname(src), "{}-{}.safetensors".format(stem, suffix)), note
+    return os.path.join(os.path.dirname(src), "SVDQuant", "{}-{}.safetensors".format(stem, suffix)), note
 
 
 def main():
