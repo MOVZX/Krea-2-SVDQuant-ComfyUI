@@ -50,23 +50,27 @@ class Krea2SVDQuantQuantize:
                                "already-quantized file cannot be used as a source, except "
                                "FP8, which is unpacked back to BF16 first.",
                 }),
-                "format": (["svdq", "w4a4", "int8", "fp8"], {
-                    "default": "svdq",
-                    "tooltip": "svdq: 4-bit weights and activations plus a low-rank bf16 "
-                               "correction branch. w4a4: the same without the branch - "
-                               "smaller and ~9%% faster per step. int8: the most faithful "
-                               "option and still ~2x fp8 on Ampere. fp8: storage only.",
+                "format": (["svdq8", "svdq", "w4a4", "w4a8", "int8", "fp8"], {
+                    "default": "svdq8",
+                    "tooltip": "svdq8 (default): 4-bit weights, 8-bit activations plus a "
+                               "low-rank bf16 correction branch -- the 8-bit activations "
+                               "leave far less error for the branch to absorb than svdq's "
+                               "4-bit ones, at the cost of the INT8 (not INT4) tensor-core "
+                               "path. svdq: the same branch on a w4a4 base -- fastest, "
+                               "least faithful. w4a8 / w4a4: no branch - smaller and "
+                               "faster per step. int8: the most faithful option and still "
+                               "~2x fp8 on Ampere. fp8: storage only.",
                 }),
                 "rank": ("INT", {
                     "default": 256, "min": 8, "max": 1024, "step": 8,
-                    "tooltip": "svdq only: size of the low-rank branch. Only pays off with "
+                    "tooltip": "svdq/svdq8 only: size of the low-rank branch. Only pays off with "
                                "refine_iters > 0. Without a LoRA, 64 / 128 / 256 measure the "
                                "same, so 64 is enough. With a LoRA loaded, 256 wins clearly "
                                "and 64 loses most of its advantage - so 256 if you use LoRAs.",
                 }),
                 "rank_alloc": (["uniform", "gqa"], {
                     "default": "uniform",
-                    "tooltip": "svdq only: how the rank budget is spread across the eight "
+                    "tooltip": "svdq/svdq8 only: how the rank budget is spread across the eight "
                                "projection types. Same file size either way. uniform gives "
                                "every layer the same rank. gqa moves the budget to attn.wk / "
                                "attn.wv, which absorb ~2x the quantization error at a third of "
@@ -78,7 +82,7 @@ class Krea2SVDQuantQuantize:
                 }),
                 "refine_iters": ("INT", {
                     "default": 100, "min": 0, "max": 200,
-                    "tooltip": "svdq only. 0 is a single-shot SVD split (~54s); 100 refines "
+                    "tooltip": "svdq/svdq8 only. 0 is a single-shot SVD split (~54s); 100 refines "
                                "the branch against the quantization error and early-stops "
                                "(~5.7min). Keep this on if rank > 16: refinement is what "
                                "makes rank behave. Without it, raising rank costs file size "
@@ -109,7 +113,7 @@ class Krea2SVDQuantQuantize:
             "optional": {
                 "act_stats": ("STRING", {
                     "default": "",
-                    "tooltip": "svdq only: an activation-statistics file from the Capture "
+                    "tooltip": "svdq/svdq8 only: an activation-statistics file from the Capture "
                                "nodes (a bare filename is looked up in ComfyUI/output/). "
                                "Fits the low-rank branch against measured per-channel "
                                "activation energy instead of assuming it is uniform. Free at "
@@ -122,7 +126,7 @@ class Krea2SVDQuantQuantize:
                 # every value in a workflow saved before this input existed.
                 "seed": ("INT", {
                     "default": 0, "min": -1, "max": 0xFFFFFFFF,
-                    "tooltip": "svdq only: seed for the randomized low-rank SVD. Quantizing "
+                    "tooltip": "svdq/svdq8 only: seed for the randomized low-rank SVD. Quantizing "
                                "twice with the same seed on the same GPU now gives identical "
                                "files; -1 restores the old unseeded behaviour, where it did "
                                "not. The same seed on a different device still differs (~1e-4 "
@@ -189,10 +193,11 @@ class Krea2SVDQuantQuantize:
     FUNCTION = "run"
     CATEGORY = _CATEGORY
     TITLE = "Krea2 SVDQuant Quantize"
-    DESCRIPTION = ("Builds a quantized Krea 2 checkpoint from a BF16 one, without leaving "
-                   "ComfyUI. BLOCKS THE QUEUE while it runs (54s to ~6min), unloads any "
-                   "loaded model to free the GPU, and writes ~8 GB. Load the result with the "
-                   "Krea2 SVDQuant W4A4 Loader (svdq) or the stock UNETLoader (w4a4/int8/fp8).")
+    DESCRIPTION = ("Builds a quantized Krea 2 checkpoint from a BF16 one (svdq8, the "
+                   "W4A8 + low-rank build, by default), without leaving ComfyUI. BLOCKS THE "
+                   "QUEUE while it runs (54s to ~6min), unloads any loaded model to free the "
+                   "GPU, and writes ~8 GB. Load the result with the Krea2 SVDQuant Loader "
+                   "(svdq/svdq8) or the stock UNETLoader (w4a4/w4a8/int8/fp8).")
 
     def run(self, source_model, format, rank, rank_alloc, refine_iters, groupsize, variant,
             output_name, overwrite, act_stats="", seed=0):
@@ -212,9 +217,10 @@ class Krea2SVDQuantQuantize:
             derived_full = os.path.join(folder_paths.get_output_directory(), derived)
             stats_path = derived_full if os.path.isfile(derived_full) else None
         if stats_path is not None:
-            if format != "svdq":
-                raise RuntimeError("act_stats only applies to format 'svdq': it weights the "
-                                   "low-rank branch, and the other formats have no branch.")
+            if format not in ("svdq", "svdq8"):
+                raise RuntimeError("act_stats only applies to the svdq formats: it weights "
+                                   "the low-rank branch, and the other formats have no "
+                                   "branch.")
             if not os.path.isabs(stats_path):
                 stats_path = os.path.join(folder_paths.get_output_directory(), stats_path)
             if not os.path.isfile(stats_path):
@@ -268,7 +274,7 @@ class Krea2SVDQuantQuantize:
                           act_stats=stats_path, seed=None if seed < 0 else int(seed))
 
         hint = SAMPLER_HINTS.get(variant)
-        loader = ("Krea2 SVDQuant W4A4 Loader" if rank else "the stock UNETLoader")
+        loader = ("Krea2 SVDQuant Loader" if rank else "the stock UNETLoader")
         text = "\n".join(x for x in (
             summary, "Load it with {}.".format(loader), hint) if x)
         logging.info("[krea2-svdquant] %s", text)

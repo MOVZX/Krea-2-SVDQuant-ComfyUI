@@ -1,8 +1,9 @@
-"""Loader for SVDQuant-on-native-W4A4 checkpoints (built by ``quantize_krea2.py``).
+"""Loader for SVDQuant-on-convrot checkpoints (built by ``quantize_krea2.py``).
 
 This is SVDQuant's mechanism (low-rank bf16 branch + 4-bit residual) running on ComfyUI's
-own ``convrot_w4a4`` kernel. Because the *activations* are 4-bit here too, the matmul runs
-on hardware that is genuinely faster than bf16 -- weight-only 4-bit schemes keep 16-bit
+own convrot kernels -- a ``convrot_w4a4`` (W4A4) or ``asym_w4a8_int8`` (W4A8) base, chosen
+at quantize time. On the W4A4 base the *activations* are 4-bit too, so the matmul runs on
+hardware that is genuinely faster than bf16 -- weight-only 4-bit schemes keep 16-bit
 activations and therefore still run at bf16 tensor-core speed.
 
 The checkpoint is self-contained - it carries the quantized blocks *and* the untouched
@@ -432,6 +433,8 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
     # rank recovered from the factor shape exactly as before. The shapes are the ground
     # truth, so they win over a metadata value that disagrees with them.
     meta = metadata or {}
+    base_fmt = {"convrot_w4a4": "w4a4", "asym_w4a8_int8": "w4a8"} \
+        .get(meta.get("krea2_svdquant_format"), "w4a4")
     rank_desc = (str(next(iter(ranks))) if len(ranks) == 1
                  else "{}-{} mixed".format(min(ranks), max(ranks)))
     meta_rank = meta.get("krea2_svdquant_rank")
@@ -452,10 +455,10 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
     else:
         compile_desc = "compile: all {} layers are graph breaks{}".format(
             attached, " ({})".format(_W4A4_OP_ERROR) if _W4A4_OP_ERROR else "")
-    summary = ("w4a4 + low-rank: attached {} branches (rank {}, variant {}), "
+    summary = ("{} + low-rank: attached {} branches (rank {}, variant {}), "
                "model_size {:.2f} GiB, {}".format(
-                   attached, rank_desc, variant, patcher.model_size() / 1024 ** 3,
-                   compile_desc))
+                   base_fmt, attached, rank_desc, variant,
+                   patcher.model_size() / 1024 ** 3, compile_desc))
     logging.info("[krea2-svdquant] %s", summary)
 
     dispatch = log_dispatch(diffusion_model)
@@ -474,10 +477,10 @@ class Krea2SVDQuantW4A4Loader:
         return {
             "required": {
                 "model_name": (folder_paths.get_filename_list("diffusion_models"), {
-                    "tooltip": "A checkpoint from quantize_krea2.py --format svdq (it carries "
-                               "*.svdq_l1/*.svdq_l2 tensors). The --format w4a4 / int8 / fp8 "
-                               "checkpoints have no branch and load with the stock UNETLoader "
-                               "instead.",
+                    "tooltip": "A checkpoint from quantize_krea2.py --format svdq or svdq8 "
+                               "(it carries *.svdq_l1/*.svdq_l2 tensors). The --format "
+                               "w4a4 / w4a8 / int8 / fp8 checkpoints have no branch and load "
+                               "with the stock UNETLoader instead.",
                 }),
             }
         }
@@ -490,10 +493,10 @@ class Krea2SVDQuantW4A4Loader:
     OUTPUT_NODE = True
     FUNCTION = "load"
     CATEGORY = _CATEGORY
-    TITLE = "Krea2 SVDQuant W4A4 Loader"
-    DESCRIPTION = ("Loads a W4A4 + low-rank (SVDQuant) Krea2 checkpoint. Self-contained: "
-                   "no separate base model needed. The status output tells you whether the "
-                   "fast int4 kernel is in play.")
+    TITLE = "Krea2 SVDQuant Loader"
+    DESCRIPTION = ("Loads a convrot-quantized (W4A4 or W4A8) + low-rank (SVDQuant) Krea2 "
+                   "checkpoint. Self-contained: no separate base model needed. The status "
+                   "output tells you whether the fast tensor-core kernel is in play.")
 
     def load(self, model_name):
         path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
@@ -503,4 +506,4 @@ class Krea2SVDQuantW4A4Loader:
 
 
 NODE_CLASS_MAPPINGS = {"Krea2SVDQuantW4A4Loader": Krea2SVDQuantW4A4Loader}
-NODE_DISPLAY_NAME_MAPPINGS = {"Krea2SVDQuantW4A4Loader": "Krea2 SVDQuant W4A4 Loader"}
+NODE_DISPLAY_NAME_MAPPINGS = {"Krea2SVDQuantW4A4Loader": "Krea2 SVDQuant Loader"}

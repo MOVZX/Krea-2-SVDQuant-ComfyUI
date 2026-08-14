@@ -53,9 +53,11 @@ _CK_IMPORT_ERROR = None
 try:
     from comfy_kitchen.registry import registry as ck_registry
     from comfy_kitchen.tensor.convrot_w4a4 import TensorCoreConvRotW4A4Layout
+    from comfy_kitchen.tensor.w4a8_int8 import AsymW4A8Int8Layout
 except Exception as exc:  # pragma: no cover - depends on the install
     ck_registry = None
     TensorCoreConvRotW4A4Layout = None
+    AsymW4A8Int8Layout = None
     _CK_IMPORT_ERROR = "{}: {}".format(type(exc).__name__, exc)
 
 # 1024x1024 with Krea2's patch size lands on (1024/16)^2 tokens. Sampling shape drives
@@ -64,6 +66,7 @@ except Exception as exc:  # pragma: no cover - depends on the install
 _DEFAULT_TOKENS = (1024 // 16) * (1024 // 16)
 
 _FUNC = "convrot_w4a4_linear"
+_W4A8_FUNC = "w4a8_int8_linear"
 
 # One category for every node in this pack. Under `advanced/loaders` they were scattered
 # among ComfyUI's own dozen-plus loaders; class names are what saved workflows match on, so
@@ -71,19 +74,25 @@ _FUNC = "convrot_w4a4_linear"
 _CATEGORY = "Krea2/SVDQuant"
 
 
-def _is_convrot_w4a4(weight) -> bool:
-    """True for a QuantizedTensor carrying this repo's convrot_w4a4 layout."""
+def _is_convrot_quantized(weight) -> bool:
+    """True for a QuantizedTensor carrying a convrot layout (W4A4 or W4A8).
+
+    The two layouts share ``convrot_groupsize`` and differ in the rest: W4A4's Params
+    record ``linear_dtype``, W4A8's record ``group_size``. int8-convrot carries a
+    ``convrot`` flag instead of either, so it is not matched here.
+    """
     params = getattr(weight, "_params", None)
     if params is None:
         return False
-    return hasattr(params, "convrot_groupsize") and hasattr(params, "linear_dtype")
+    return hasattr(params, "convrot_groupsize") and (
+        hasattr(params, "linear_dtype") or hasattr(params, "group_size"))
 
 
 def quantized_linears(diffusion_model):
-    """(name, module) for every Linear whose weight is a convrot_w4a4 QuantizedTensor."""
+    """(name, module) for every Linear whose weight is a convrot-quantized QuantizedTensor."""
     for name, module in diffusion_model.named_modules():
         weight = getattr(module, "weight", None)
-        if weight is not None and _is_convrot_w4a4(weight):
+        if weight is not None and _is_convrot_quantized(weight):
             yield name, module
 
 
@@ -110,27 +119,59 @@ def branch_factors(module):
     return None if l1 is None or l2 is None else (l1, l2)
 
 
+def _probe_op(module) -> str | None:
+    """The comfy_kitchen op this module's matmul dispatches to, by layout."""
+    params = getattr(module.weight, "_params", None)
+    if params is None:
+        return None
+    if hasattr(params, "linear_dtype"):  # W4A4
+        return _FUNC
+    if hasattr(params, "group_size"):  # W4A8
+        return _W4A8_FUNC
+    return None
+
+
 def _probe_kwargs(module, tokens: int, device) -> dict:
-    """Kwargs shaped exactly like a real `convrot_w4a4_linear` call, for validation.
+    """Kwargs shaped exactly like a real quantized-linear call, for validation.
 
     The activation and the weight tensors are `torch.empty` rather than copies: the
     registry validates dtype, ndim, device and divisibility, never contents, and a real
     copy of a 6144x16384 packed weight is 50 MB we would rather not move on the card
     that is already OOMing.
     """
-    qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(module.weight)
     params = module.weight._params
     x_dtype = params.orig_dtype if params.orig_dtype in (
         torch.float32, torch.float16, torch.bfloat16) else torch.bfloat16
     in_features = int(params.orig_shape[1])
+    if hasattr(params, "linear_dtype"):  # W4A4
+        qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(module.weight)
+        return {
+            "x": torch.empty((tokens, in_features), dtype=x_dtype, device=device),
+            "qweight": torch.empty(tuple(qweight.shape), dtype=qweight.dtype, device=device),
+            "wscales": torch.empty(tuple(wscales.shape), dtype=wscales.dtype, device=device),
+            "bias": None,
+            "convrot_groupsize": params.convrot_groupsize,
+            "quant_group_size": params.quant_group_size,
+            "linear_dtype": params.linear_dtype,
+        }
+    # W4A8
+    qdata, s_rel, s_channel, correction, codebook = \
+        AsymW4A8Int8Layout.get_plain_tensors(module.weight)
+
+    def _empty(t):
+        return None if t is None else torch.empty(tuple(t.shape), dtype=t.dtype, device=device)
+
     return {
         "x": torch.empty((tokens, in_features), dtype=x_dtype, device=device),
-        "qweight": torch.empty(tuple(qweight.shape), dtype=qweight.dtype, device=device),
-        "wscales": torch.empty(tuple(wscales.shape), dtype=wscales.dtype, device=device),
+        "qdata": _empty(qdata),
+        "s_rel": _empty(s_rel),
+        "s_channel": _empty(s_channel),
+        "codebook": _empty(codebook),
+        "correction": _empty(correction),
         "bias": None,
+        "group_size": params.group_size,
         "convrot_groupsize": params.convrot_groupsize,
-        "quant_group_size": params.quant_group_size,
-        "linear_dtype": params.linear_dtype,
+        "out_dtype": x_dtype,
     }
 
 
@@ -143,6 +184,10 @@ def resolve_dispatch(module, tokens: int = _DEFAULT_TOKENS, device=None):
     if ck_registry is None:
         return None, None, {"__import__": _CK_IMPORT_ERROR}
 
+    func = _probe_op(module)
+    if func is None:
+        return None, None, {"__probe__": "unsupported quantized layout"}
+
     device = device or mm.get_torch_device()
     try:
         kwargs = _probe_kwargs(module, tokens, device)
@@ -151,13 +196,13 @@ def resolve_dispatch(module, tokens: int = _DEFAULT_TOKENS, device=None):
 
     failures = {}
     for name in ("cuda", "triton", "eager"):
-        result = ck_registry.validate_backend_for_call(name, _FUNC, kwargs)
+        result = ck_registry.validate_backend_for_call(name, func, kwargs)
         if not result.success:
             failures[name] = "{}: {}".format(result.failed_param, result.failure_reason)
 
     try:
-        backend = ck_registry.get_capable_backend(_FUNC, kwargs)
-        impl = ck_registry.get_implementation(_FUNC, kwargs=kwargs)
+        backend = ck_registry.get_capable_backend(func, kwargs)
+        impl = ck_registry.get_implementation(func, kwargs=kwargs)
         impl_path = "{}.{}".format(impl.__module__, impl.__qualname__)
     except Exception as exc:
         return None, None, failures or {"__dispatch__": str(exc)}
@@ -167,7 +212,7 @@ def resolve_dispatch(module, tokens: int = _DEFAULT_TOKENS, device=None):
     return backend, impl_path, failures
 
 
-def dispatch_warning(backend: str | None, failures: dict) -> str | None:
+def dispatch_warning(backend: str | None, failures: dict, func: str = _FUNC) -> str | None:
     """The message the loader prints when the fast kernel is not in play.
 
     Deliberately not caveman-terse and not abbreviated: this text ends up pasted into
@@ -178,9 +223,9 @@ def dispatch_warning(backend: str | None, failures: dict) -> str | None:
 
     cuda_reason = (failures or {}).get("cuda", "unknown")
     lines = [
-        "[krea2-svdquant] WARNING: convrot_w4a4 will dispatch to the '{}' backend, not "
-        "'cuda'.".format(backend or "<none>"),
-        "  The non-CUDA path unpacks int4 to bf16 in Python and runs an ordinary matmul, "
+        "[krea2-svdquant] WARNING: {} will dispatch to the '{}' backend, not "
+        "'cuda'.".format(func, backend or "<none>"),
+        "  The non-CUDA path dequantizes the weights in Python and runs an ordinary matmul, "
         "so this checkpoint will be SLOWER than fp8 or even plain bf16.",
         "  cuda backend was rejected because: {}".format(cuda_reason),
     ]
@@ -252,23 +297,28 @@ def log_dispatch(diffusion_model) -> str:
         first = next(iter(quantized_linears(diffusion_model)), None)
         if first is None:
             return ""
+        func = _probe_op(first[1])
+        if func is None:
+            return ""
         backend, impl_path, failures = resolve_dispatch(first[1])
         if backend is None:
-            logging.warning("[krea2-svdquant] could not resolve a convrot_w4a4 backend: %s",
-                            failures)
-            return "could not resolve a convrot_w4a4 backend: {}".format(failures)
-        logging.info("[krea2-svdquant] convrot_w4a4 dispatch backend: %s (%s)",
-                     backend, impl_path)
-        warning = dispatch_warning(backend, failures)
+            logging.warning("[krea2-svdquant] could not resolve a %s backend: %s",
+                            func, failures)
+            return "could not resolve a {} backend: {}".format(func, failures)
+        logging.info("[krea2-svdquant] %s dispatch backend: %s (%s)",
+                     func, backend, impl_path)
+        warning = dispatch_warning(backend, failures, func)
         if warning:
             logging.warning("%s", warning)
-        # Reported even when the backend is 'cuda': on Turing the kernel is live and still
-        # slow, which is exactly the case `dispatch_warning` stays silent about.
-        arch = architecture_note()
+        # Reported even when the backend is 'cuda': on Turing the int4 kernel is live and
+        # still slow, which is exactly the case `dispatch_warning` stays silent about. It
+        # is a W4A4-specific note -- W4A8 runs on the int8 path, which Turing serves at
+        # full rate.
+        arch = architecture_note() if func == _FUNC else None
         if arch:
             logging.warning("%s", arch)
         return "\n".join(x for x in (
-            "convrot_w4a4 dispatch backend: {} ({})".format(backend, impl_path),
+            "{} dispatch backend: {} ({})".format(func, backend, impl_path),
             warning, arch) if x)
     except Exception:
         # A diagnostic must never be the reason a model fails to load.
@@ -294,26 +344,29 @@ def report_backend_status() -> str:
         return "\n".join(lines)
 
     for name, info in sorted(ck_registry.list_backends().items()):
-        lines.append("{:<8} available={:<5} disabled={:<5} implements {}={:<5} reason={}".format(
-            name, str(info["available"]), str(info["disabled"]), _FUNC,
-            str(_FUNC in info["capabilities"]), info["unavailable_reason"] or "-"))
+        lines.append("{:<8} available={:<5} disabled={:<5} implements {}={} {}={} reason={}".format(
+            name, str(info["available"]), str(info["disabled"]),
+            _FUNC, str(_FUNC in info["capabilities"]),
+            _W4A8_FUNC, str(_W4A8_FUNC in info["capabilities"]),
+            info["unavailable_reason"] or "-"))
 
     active = [n for n, i in ck_registry.list_backends().items()
-              if i["available"] and not i["disabled"] and _FUNC in i["capabilities"]]
+              if i["available"] and not i["disabled"]
+              and (_FUNC in i["capabilities"] or _W4A8_FUNC in i["capabilities"])]
     lines.append("")
     if "cuda" in active:
-        lines.append("cuda backend is live -- the int4 tensor-core kernel is available.")
-        # "Available" is not "fast" on pre-Ampere, and this report is the one people read
-        # before downloading 8 GB.
+        lines.append("cuda backend is live -- the tensor-core kernels are available.")
+        # "Available" is not "fast" on pre-Ampere for the int4 path, and this report is
+        # the one people read before downloading 8 GB.
         arch = architecture_note()
         if arch:
             lines.append("")
             lines.append(arch)
     else:
         lines.append(
-            "cuda backend is NOT live. convrot_w4a4 will fall back to {}, which unpacks "
-            "int4 to bf16 in Python -- expect this checkpoint to be slower than fp8."
-            .format(active or "nothing"))
+            "cuda backend is NOT live. quantized layers will fall back to {}, which "
+            "dequantizes the weights in Python -- expect the checkpoint to be slower "
+            "than fp8.".format(active or "nothing"))
         cuda_build = torch.version.cuda
         if cuda_build is None or int(str(cuda_build).split(".")[0]) < 13:
             lines.append(
@@ -393,7 +446,7 @@ def report_env(patcher) -> list[str]:
 
     lines.append("")
     lines.append("== quantized layers ==")
-    lines.append("convrot_w4a4 linears : {}".format(count))
+    lines.append("convrot linears      : {}".format(count))
     lines.append("weight devices       : {}".format(devices or "none"))
     lines.append("low-rank factors     : {} tensors, {:.1f} MiB".format(
         sum(branch_devices.values()), branch_bytes / 1024 ** 2))
@@ -428,14 +481,15 @@ def report_dispatch(patcher, tokens: int) -> list[str]:
         lines.append("{:<8} available={:<5} disabled={:<5} reason={}".format(
             name, str(info["available"]), str(info["disabled"]),
             info["unavailable_reason"] or "-"))
-        lines.append("         implements {}: {}".format(
-            _FUNC, _FUNC in info["capabilities"]))
+        lines.append("         implements {}={}, {}={}".format(
+            _FUNC, _FUNC in info["capabilities"],
+            _W4A8_FUNC, _W4A8_FUNC in info["capabilities"]))
 
     lines.append("")
     lines.append("== dispatch per weight shape (tokens={}) ==".format(tokens))
     shapes = _distinct_shapes(patcher.model.diffusion_model)
     if not shapes:
-        lines.append("no convrot_w4a4 layers found")
+        lines.append("no convrot-quantized layers found")
         return lines
 
     for shape, (name, module) in sorted(shapes.items()):

@@ -3,22 +3,31 @@
 ComfyUI already ships native kernels for these formats via comfy_kitchen, so the output
 loads with a plain ``UNETLoader`` -- no custom node, and ordinary LoRA loaders work.
 
-Four targets:
+Five targets:
 
 * ``int8``  -> ``int8_tensorwise`` with per-channel scales + convrot (W8A8).
                Natively accelerated on Ampere INT8 tensor cores.
 * ``w4a4``  -> ``convrot_w4a4`` (W4A4), smaller and potentially faster, 4-bit quality.
+* ``w4a8``  -> ``asym_w4a8_int8`` (W4A8): 4-bit weights, 8-bit activations. The extra
+               activation bits leave far less error for the sampler to compound, at the
+               cost of the INT8 tensor-core path instead of INT4 -- slower per step than
+               ``w4a4``, closer to ``int8`` in fidelity.
 * ``svdq``  -> the same W4A4 residual plus an SVDQuant low-rank bf16 branch, which
                absorbs the outlier directions 4 bits handle worst. Needs this repo's
                loader node; a plain ``UNETLoader`` cannot see the branch.
+* ``svdq8`` -> the SVDQuant low-rank bf16 branch on a ``w4a8`` base. With the
+               activations at 8 bits the branch has strictly less error to absorb, so at
+               a given rank it should read closer to the int8 build than ``svdq`` does;
+               per-step speed follows the ``w4a8`` base. Needs this repo's loader node,
+               like ``svdq``.
 * ``fp8``   -> ``float8_e4m3fn``, a single per-tensor scale, no convrot, no calibration.
-               Lightest touch of the four -- best fidelity, smallest speedup, and the
+               Lightest touch of the five -- best fidelity, smallest speedup, and the
                only one that needs no rotation or outlier handling because 8-bit float
                already has enough dynamic range for these weights.
 
-None of them need a calibration dataset: int8/w4a4/svdq spread outliers analytically via
-the convrot (group-wise Hadamard) rotation, and activations are quantized by the kernel at
-run time; fp8 just needs one abs-max scale per tensor.
+None of them need a calibration dataset: int8/w4a4/w4a8/svdq/svdq8 spread outliers
+analytically via the convrot (group-wise Hadamard) rotation, and activations are
+quantized by the kernel at run time; fp8 just needs one abs-max scale per tensor.
 
 Only the 224 transformer-block linears are quantized, matching the layer set used by the
 reference ``krea2_raw_int8_convrot`` checkpoint. Norms, modulation, the text-fusion stack
@@ -30,7 +39,7 @@ release share the same block naming, so the same command converts either. What d
 how you sample afterwards, not how you quantize -- pass ``--variant`` so the output is
 named accordingly and the file records which one it came from.
 
-    python quantize_krea2.py <bf16-model.safetensors> [--format int8|w4a4|svdq|fp8]
+    python quantize_krea2.py <bf16-model.safetensors> [--format int8|w4a4|w4a8|svdq|svdq8|fp8]
                              [--rank 64] [--variant turbo|base] [--out PATH]
 """
 
@@ -595,6 +604,10 @@ def _quantize_raw(weight: torch.Tensor, fmt: str, groupsize: int):
         qdata, params = layout.quantize(weight, convrot_groupsize=groupsize)
         conf = {"format": "convrot_w4a4", "convrot_groupsize": groupsize,
                 "linear_dtype": getattr(params, "linear_dtype", "int4")}
+    elif fmt == "asym_w4a8_int8":
+        qdata, params = layout.quantize(weight, convrot_groupsize=groupsize)
+        conf = {"format": "asym_w4a8_int8", "group_size": params.group_size,
+                "convrot_groupsize": groupsize}
     elif fmt == "float8_e4m3fn":
         qdata, params = layout.quantize(weight, scale="recalculate")
         conf = {"format": "float8_e4m3fn"}
@@ -605,6 +618,19 @@ def _quantize_raw(weight: torch.Tensor, fmt: str, groupsize: int):
 
 def quantize_weight(weight: torch.Tensor, fmt: str, groupsize: int):
     qdata, params, _, conf = _quantize_raw(weight, fmt, groupsize)
+    if fmt == "asym_w4a8_int8":
+        # W4A8 carries several scale tensors, not one. ComfyUI's load path reads exactly
+        # these key names (weight_s_rel / weight_s_channel / weight_codebook); a
+        # correction tensor has no load path, and symmetric quantization never produces
+        # one -- refusing here rather than dropping it silently.
+        if params.correction is not None:
+            raise RuntimeError("asym_w4a8_int8 produced a correction tensor, which the "
+                               "checkpoint format cannot store (symmetric quantization "
+                               "requested)")
+        scales = {"weight_s_rel": params.scale, "weight_s_channel": params.s_channel}
+        if params.codebook is not None:
+            scales["weight_codebook"] = params.codebook
+        return qdata, scales, conf
     return qdata, {"weight_scale": params.scale}, conf
 
 
@@ -707,7 +733,9 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
             if key.endswith(".weight"):
                 layer = key[: -len(".weight")]
                 if is_target(layer, prefix):
-                    for suffix in ("weight_scale", "weight_scale_2", "input_scale", "comfy_quant"):
+                    for suffix in ("weight_scale", "weight_scale_2", "input_scale",
+                                   "weight_s_rel", "weight_s_channel", "weight_codebook",
+                                   "weight_correction", "comfy_quant"):
                         stale_companions.add("{}.{}".format(layer, suffix))
 
         for i, key in enumerate(keys):
@@ -858,7 +886,9 @@ _EXPECTED_LAYERS = 28 * len(_QUANT_SUFFIXES)
 _FORMAT_ALIASES = {
     "int8": "int8_tensorwise",
     "w4a4": "convrot_w4a4",
+    "w4a8": "asym_w4a8_int8",
     "svdq": "convrot_w4a4",
+    "svdq8": "asym_w4a8_int8",
     "fp8": "float8_e4m3fn",
 }
 
@@ -881,15 +911,18 @@ def resolve_format(fmt_name: str, rank: int, rank_was_set: bool = True) -> tuple
     fmt = _FORMAT_ALIASES[fmt_name]
     if fmt not in QUANT_ALGOS:
         raise RuntimeError("{} is not available in this ComfyUI build".format(fmt))
+    ranked = fmt_name in ("svdq", "svdq8")
     # Silently zeroing the rank here used to make `--format w4a4 --rank 128` look like it had
     # done something it had not.
-    if fmt_name != "svdq" and rank_was_set:
+    if not ranked and rank_was_set:
         raise RuntimeError(
-            "rank only applies to format 'svdq' (you asked for '{}'). The low-rank branch is "
-            "what distinguishes svdq from plain w4a4.".format(fmt_name))
-    if fmt_name == "svdq" and rank <= 0:
-        raise RuntimeError("format 'svdq' needs rank > 0; use format 'w4a4' for no branch")
-    return fmt, (rank if fmt_name == "svdq" else 0)
+            "rank only applies to the svdq formats (you asked for '{}'). The low-rank branch "
+            "is what distinguishes svdq from plain w4a4 / svdq8 from plain w4a8.".format(fmt_name))
+    if ranked and rank <= 0:
+        base = "w4a4" if fmt_name == "svdq" else "w4a8"
+        raise RuntimeError(
+            "format '{}' needs rank > 0; use format '{}' for no branch".format(fmt_name, base))
+    return fmt, (rank if ranked else 0)
 
 
 def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
@@ -908,8 +941,13 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
     # Same reasoning as alloc_tag: an activation-weighted build is byte-identical in shape to
     # a plain one, so without a tag the two are indistinguishable on disk.
     act_tag = "-actaware" if act_stats else ""
-    suffix = ("SVDQuant-W4A4-rank{}{}{}".format(rank, alloc_tag, act_tag) if rank else
-              ("{}-convrot".format(fmt_name.upper()) if fmt_name != "fp8" else "FP8"))
+    if rank:
+        base_tag = "W4A4" if _FORMAT_ALIASES[fmt_name] == "convrot_w4a4" else "W4A8"
+        suffix = "SVDQuant-{}-rank{}{}{}".format(base_tag, rank, alloc_tag, act_tag)
+    elif fmt_name != "fp8":
+        suffix = "{}-convrot".format(fmt_name.upper())
+    else:
+        suffix = "FP8"
     return os.path.join(os.path.dirname(src), "SVDQuant", "{}-{}.safetensors".format(stem, suffix)), note
 
 
@@ -917,8 +955,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src", nargs="?", default=None,
                     help="Source model path (omit to select interactively)")
-    ap.add_argument("--format", choices=["int8", "w4a4", "svdq", "fp8"], default="svdq",
-                    help="svdq = w4a4 residual + SVDQuant low-rank bf16 branch; "
+    ap.add_argument("--format", choices=["int8", "w4a4", "w4a8", "svdq", "svdq8", "fp8"],
+                    default="svdq8",
+                    help="svdq8 (default) = w4a8 residual + SVDQuant low-rank bf16 branch; "
+                         "svdq = the same on a w4a4 base (fastest, least faithful); "
+                         "w4a8/w4a4 = no branch; "
                          "fp8 = float8_e4m3fn, no convrot, no low-rank branch")
     ap.add_argument("--groupsize", type=int, default=256, help="unused for fp8")
     ap.add_argument("--rank", type=int, default=256, help="low-rank branch budget, svdq only")
@@ -965,8 +1006,8 @@ def main():
     _free_comfyui_memory()
 
     if args.act_stats:
-        if args.format != "svdq":
-            raise SystemExit("--act-stats only applies to format 'svdq': it weights the "
+        if args.format not in ("svdq", "svdq8"):
+            raise SystemExit("--act-stats only applies to the svdq formats: it weights the "
                              "low-rank split, and the other formats have no branch")
         if not os.path.exists(args.act_stats):
             raise SystemExit("--act-stats file not found: {}".format(args.act_stats))
@@ -996,7 +1037,7 @@ def main():
         raise SystemExit(str(exc)) from None
 
     if args.rank_alloc != "uniform" and not rank:
-        raise SystemExit("--rank-alloc only applies to format 'svdq'")
+        raise SystemExit("--rank-alloc only applies to the svdq formats")
 
     out = args.out
     if out is None:

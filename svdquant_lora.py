@@ -1,4 +1,4 @@
-"""LoRA support for Krea2 W4A4 quantized models (from ``quantize_krea2.py``).
+"""LoRA support for Krea2 convrot-quantized (W4A4 / W4A8) models (from ``quantize_krea2.py``).
 
 A normal `LoraLoaderModelOnly` cannot patch these quantized layers correctly: ComfyUI
 applies a LoRA by adding `down @ up` onto a module's `.weight`, but here `.weight` is a
@@ -276,8 +276,8 @@ class Krea2SVDQuantLoraLoader:
         return {
             "required": {
                 "model": ("MODEL", {
-                    "tooltip": "Output of the Krea2 SVDQuant W4A4 Loader, or any Krea2 "
-                               "checkpoint with convrot_w4a4 quantized blocks.",
+                    "tooltip": "Output of the Krea2 SVDQuant Loader, or any Krea2 checkpoint "
+                               "with convrot-quantized (W4A4 / W4A8) blocks.",
                 }),
                 "lora_name": (folder_paths.get_filename_list("loras"), {
                     "tooltip": "A Krea2 LoRA. Targets 'blocks.N.{attn,mlp}.*' under either "
