@@ -51,6 +51,7 @@ import importlib.util
 import json
 import math
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -127,8 +128,29 @@ LAYER_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
 _DEQUANTIZABLE_FORMATS = ("float8_e4m3fn", "float8_e5m2")
 
 
-def _MIN_SOURCE_BYTES() -> int:
-    return 20 * 1024 ** 3
+def source_kind(path: str) -> str:
+    """Classify a checkpoint by the dtype of its transformer-block weights.
+
+    'bf16' = BF16/FP16 only, 'fp8' = any FP8 target layer, 'other' = anything
+    we cannot reconstruct (or no Krea 2 blocks at all). Header-only, so scanning
+    a folder of 24 GB files stays cheap.
+    """
+    with open(path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        try:
+            header = json.loads(f.read(n))
+        except (struct.error, json.JSONDecodeError, UnicodeDecodeError):
+            return "other"
+    dtypes = {v["dtype"] for k, v in header.items()
+              if k.endswith(".weight")
+              and any(k[:-7].endswith(s) for s in _QUANT_SUFFIXES)}
+    if not dtypes:
+        return "other"
+    if dtypes <= {"BF16", "F16"}:
+        return "bf16"
+    if dtypes <= {"BF16", "F16", "F8_E4M3", "F8_E5M2"}:
+        return "fp8"
+    return "other"
 
 
 def _free_comfyui_memory() -> None:
@@ -172,33 +194,35 @@ def _select_model() -> str:
         }
 
     candidates = []
-    for f in os.listdir(models_dir):
+    for f in sorted(os.listdir(models_dir)):
         if not f.endswith(".safetensors"):
             continue
         full = os.path.join(models_dir, f)
         if not os.path.isfile(full):
             continue
-        if os.path.getsize(full) < _MIN_SOURCE_BYTES():
-            continue
         stem = os.path.splitext(f)[0]
         if any(qs.startswith(stem + "-") for qs in quantized_stems):
             continue
-        candidates.append(full)
+        kind = source_kind(full)
+        if kind == "other":
+            continue
+        candidates.append((full, kind))
 
     if not candidates:
-        raise SystemExit("No eligible models found (>20GB, not yet quantized).")
+        raise SystemExit("No eligible models found (BF16/FP16 or FP8 source, not yet quantized).")
 
     print("Available models:")
-    for i, path in enumerate(candidates, 1):
+    for i, (path, kind) in enumerate(candidates, 1):
         size_gb = os.path.getsize(path) / 1024 ** 3
-        print("  {}. {} ({:.1f} GB)".format(i, os.path.basename(path), size_gb))
+        tag = "  [FP8 source - use w4a8/svdq8]" if kind == "fp8" else ""
+        print("  {}. {} ({:.1f} GB){}".format(i, os.path.basename(path), size_gb, tag))
 
     while True:
         choice = input("Select model (number): ").strip()
         try:
             idx = int(choice) - 1
             if 0 <= idx < len(candidates):
-                return candidates[idx]
+                return candidates[idx][0]
         except ValueError:
             pass
         print("Invalid choice. Pick 1-{}.".format(len(candidates)))
