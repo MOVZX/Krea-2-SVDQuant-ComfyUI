@@ -156,7 +156,8 @@ def main():
     ap.add_argument("src", help="the high-precision checkpoint (raw.safetensors, turbo...)")
     ap.add_argument("--lora", action="append", required=True, metavar="PATH[:STRENGTH]",
                     help="repeat to bake several, in order; strength defaults to 1.0")
-    ap.add_argument("--format", choices=["int8", "w4a4", "svdq", "fp8"], default="svdq")
+    ap.add_argument("--format", choices=["int8", "w4a4", "w4a8", "svdq", "svdq8", "fp8"],
+                    default="svdq")
     ap.add_argument("--groupsize", type=int, default=256)
     ap.add_argument("--rank", type=int, default=256)
     ap.add_argument("--rank-alloc", default="uniform")

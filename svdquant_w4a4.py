@@ -177,27 +177,28 @@ def _shield_from_dynamo(module: torch.nn.Module) -> None:
                       type(module).__name__, exc)
 
 
-# The opaque op. Registering the kernel call under `torch.library` is the whole trick:
+# The opaque ops. Registering the kernel call under `torch.library` is the whole trick:
 # Dynamo does not try to trace *into* a custom op, it emits a single node for it, so the
 # 224 linears stop being graph breaks and a compiled step becomes one graph. The kitchen
-# call inside is byte-for-byte the one `_convrot_w4a4_forward` makes, so numerics are
-# unchanged -- this moves where the call is visible from, not what it computes.
+# call inside is byte-for-byte the one ComfyUI's own quantized forward makes for that
+# layout, so numerics are unchanged -- this moves where the call is visible from, not what
+# it computes.
 #
-# Built lazily and guarded: everything it depends on (the backend registry,
-# `TensorCoreConvRotW4A4Layout.get_plain_tensors`, the `_params` field names) is
-# comfy_kitchen's internal API, not a published one. If a kitchen update moves any of it,
-# `_w4a4_op()` returns None and the loader falls back to `_shield_from_dynamo` rather than
-# failing to load a checkpoint.
+# Built lazily and guarded: everything they depend on (the backend registry, the layout's
+# `get_plain_tensors`, the `_params` field names) is comfy_kitchen's internal API, not a
+# published one. If a kitchen update moves any of it, `_w4a4_op()` / `_w4a8_op()` return
+# None and the loader falls back to `_shield_from_dynamo` rather than failing to load a
+# checkpoint.
 _W4A4_OP = None
 _W4A4_OP_ERROR = None
 
-# Backend resolution, memoized. `convrot_w4a4_linear` re-runs it on *every call*: it builds a
-# seven-key dict, walks `["cuda", "triton", "eager"]` and revalidates seven ParamConstraints,
-# with no caching anywhere in `BackendRegistry`. At 224 layers times 8 steps that is 1792
-# resolutions per image, all of them answering the same question.
+# Backend resolution, memoized. The kernel entry points re-run it on *every call*: they
+# build a kwargs dict, walk `["cuda", "triton", "eager"]` and revalidate every
+# ParamConstraint, with no caching anywhere in `BackendRegistry`. At 224 layers times 8
+# steps that is thousands of resolutions per image, all of them answering the same question.
 #
 # The key is exactly what those constraints read -- dtypes, device and rank, since the only
-# shape rule on `x` is `MinDims(2)` and the ones on `qweight`/`wscales` are satisfied
+# shape rule on `x` is `MinDims(2)` and the ones on the weight tensors are satisfied
 # identically by every layer in the model. Token count is deliberately *not* in the key: it
 # never reaches a constraint, only kernel selection inside the implementation.
 #
@@ -207,21 +208,12 @@ _W4A4_OP_ERROR = None
 _IMPL_CACHE: dict = {}
 
 
-def _resolve_impl(x, qweight, wscales, bias, convrot_groupsize, quant_group_size,
-                  linear_dtype):
-    from comfy_kitchen.registry import registry as ck_registry
-
-    key = (x.dtype, x.device, x.ndim, qweight.dtype, wscales.dtype,
-           None if bias is None else bias.dtype,
-           convrot_groupsize, quant_group_size, linear_dtype)
-    impl = _IMPL_CACHE.get(key)
+def _resolve_impl(func: str, key: tuple, kwargs: dict):
+    impl = _IMPL_CACHE.get((func, key))
     if impl is None:
-        impl = ck_registry.get_implementation("convrot_w4a4_linear", kwargs={
-            "x": x, "qweight": qweight, "wscales": wscales, "bias": bias,
-            "convrot_groupsize": convrot_groupsize,
-            "quant_group_size": quant_group_size, "linear_dtype": linear_dtype,
-        })
-        _IMPL_CACHE[key] = impl
+        from comfy_kitchen.registry import registry as ck_registry
+        impl = ck_registry.get_implementation(func, kwargs=kwargs)
+        _IMPL_CACHE[(func, key)] = impl
     return impl
 
 
@@ -241,8 +233,14 @@ def _w4a4_op():
         def w4a4_linear(x: torch.Tensor, qweight: torch.Tensor, wscales: torch.Tensor,
                         bias: torch.Tensor | None, convrot_groupsize: int,
                         quant_group_size: int, linear_dtype: str) -> torch.Tensor:
-            impl = _resolve_impl(x, qweight, wscales, bias, convrot_groupsize,
-                                 quant_group_size, linear_dtype)
+            impl = _resolve_impl("convrot_w4a4_linear", (
+                x.dtype, x.device, x.ndim, qweight.dtype, wscales.dtype,
+                None if bias is None else bias.dtype,
+                convrot_groupsize, quant_group_size, linear_dtype), {
+                "x": x, "qweight": qweight, "wscales": wscales, "bias": bias,
+                "convrot_groupsize": convrot_groupsize,
+                "quant_group_size": quant_group_size, "linear_dtype": linear_dtype,
+            })
             return impl(x, qweight, wscales, bias=bias,
                         convrot_groupsize=convrot_groupsize,
                         quant_group_size=quant_group_size, linear_dtype=linear_dtype)
@@ -256,13 +254,69 @@ def _w4a4_op():
         _W4A4_OP = w4a4_linear
     except Exception as exc:
         _W4A4_OP_ERROR = "{}: {}".format(type(exc).__name__, exc)
-        logging.info("[krea2-svdquant] no compile-friendly kernel op (%s); falling back to "
+        logging.info("[krea2-svdquant] no compile-friendly W4A4 op (%s); falling back to "
                      "graph breaks around the quantized linears", _W4A4_OP_ERROR)
     return _W4A4_OP
 
 
-def _install_custom_op(module: torch.nn.Module) -> bool:
-    """Route this Linear's matmul through `krea2::w4a4_linear`. True if it took.
+_W4A8_OP = None
+_W4A8_OP_ERROR = None
+
+
+def _w4a8_op():
+    """The registered `krea2::w4a8_linear` op, or None if this kitchen build cannot host it.
+
+    The W4A8 twin of `_w4a4_op`: same trick (the kernel call registered under
+    `torch.library` so Dynamo emits one node instead of tracing into it), the only
+    differences being the layout's plain tensors and the `out_dtype` the kernel writes in,
+    which ComfyUI's own forward takes from `params.orig_dtype`.
+    """
+    global _W4A8_OP, _W4A8_OP_ERROR
+    if _W4A8_OP is not None or _W4A8_OP_ERROR is not None:
+        return _W4A8_OP
+
+    try:
+        from comfy_kitchen.registry import registry as ck_registry  # noqa: F401
+
+        @torch.library.custom_op("krea2::w4a8_linear", mutates_args=())
+        def w4a8_linear(x: torch.Tensor, qdata: torch.Tensor, s_rel: torch.Tensor,
+                        s_channel: torch.Tensor, codebook: torch.Tensor | None,
+                        correction: torch.Tensor | None, bias: torch.Tensor | None,
+                        group_size: int, convrot_groupsize: int,
+                        out_dtype: str) -> torch.Tensor:
+            impl = _resolve_impl("w4a8_int8_linear", (
+                x.dtype, x.device, x.ndim, qdata.dtype, s_rel.dtype, s_channel.dtype,
+                None if codebook is None else codebook.dtype,
+                None if correction is None else correction.dtype,
+                None if bias is None else bias.dtype,
+                group_size, convrot_groupsize, out_dtype), {
+                "x": x, "qdata": qdata, "s_rel": s_rel, "s_channel": s_channel,
+                "codebook": codebook, "correction": correction, "bias": bias,
+                "group_size": group_size, "convrot_groupsize": convrot_groupsize,
+                "out_dtype": getattr(torch, out_dtype),
+            })
+            return impl(x, qdata, s_rel, s_channel, codebook=codebook,
+                        correction=correction, bias=bias, group_size=group_size,
+                        convrot_groupsize=convrot_groupsize,
+                        out_dtype=getattr(torch, out_dtype))
+
+        @w4a8_linear.register_fake
+        def _(x, qdata, s_rel, s_channel, codebook, correction, bias,
+              group_size, convrot_groupsize, out_dtype):
+            # qdata is [out_features, in_features // 2] -- int4 packed two to a byte, so
+            # the output width is its *row* count and cannot be read off the last dim.
+            return x.new_empty(x.shape[:-1] + (qdata.shape[0],))
+
+        _W4A8_OP = w4a8_linear
+    except Exception as exc:
+        _W4A8_OP_ERROR = "{}: {}".format(type(exc).__name__, exc)
+        logging.info("[krea2-svdquant] no compile-friendly W4A8 op (%s); falling back to "
+                     "graph breaks around the quantized linears", _W4A8_OP_ERROR)
+    return _W4A8_OP
+
+
+def _op_forward(module, op_call, eager_call):
+    """The forward installed by `_install_custom_op`, shared by the W4A4 and W4A8 ops.
 
     The fast path deliberately handles only the case ComfyUI's own quantized forward calls
     "quantized": no LoRA weight/bias function, weight resident on the input's device, not
@@ -273,41 +327,15 @@ def _install_custom_op(module: torch.nn.Module) -> bool:
     patches and offloads weights long after this runs; when a check fails the call goes to
     the stock forward and is simply a graph break, i.e. no worse than the old behaviour.
 
-    `params.transposed` is checked once here rather than per call: a transposed weight makes
-    kitchen dequantize and run a bf16 linear (`_handle_convrot_w4a4_linear`), which is a
-    different computation, not a slower one. A checkpoint whose weights arrive transposed
-    should keep whatever kitchen does with it.
+    `op_call` runs under `torch.compiler.is_compiling()`, `eager_call` outside it. The op
+    exists for Dynamo's benefit; an eager call gains nothing from routing through
+    `torch.library` and skips that dispatch. `is_compiling()` is constant-folded during
+    tracing, so the compiled graph still gets the op node -- the same mechanism ComfyUI
+    uses to keep `run_every_op` out of compiled graphs (`comfy/ops.py`). Measured either
+    way it is within noise in eager; what the memoized `_resolve_impl` is worth is not
+    (0.846 -> 0.833 s/step on a 3090 at 1024px, rank 256, against `KREA2_W4A4_OP=0`).
     """
-    # An escape hatch, and the only honest way to A/B this: the two paths cannot coexist in
-    # one process, so the comparison is one server run against another, and a flag is what
-    # makes those two runs differ by exactly this decision.
-    if os.environ.get("KREA2_W4A4_OP") == "0":
-        return False
-    # Idempotent: the loader installs this at load time, the compile-prep node can be asked
-    # to do it again on a model that already has it, and wrapping a wrapper would put the
-    # guard block on the hot path twice for no benefit.
-    if getattr(module, "_krea2_op_installed", False):
-        return True
-
-    op = _w4a4_op()
-    if op is None:
-        return False
-
-    try:
-        from comfy_kitchen.tensor.convrot_w4a4 import TensorCoreConvRotW4A4Layout
-        params = module.weight._params
-        if params.transposed:
-            return False
-        groupsize = int(params.convrot_groupsize)
-        quant_group_size = int(params.quant_group_size)
-        linear_dtype = str(params.linear_dtype)
-    except Exception as exc:
-        logging.debug("[krea2-svdquant] cannot read layout params off %s: %s",
-                      type(module).__name__, exc)
-        return False
-
     original = module.forward
-    get_plain = TensorCoreConvRotW4A4Layout.get_plain_tensors
 
     def forward(x, *args, **kwargs):
         weight = module.weight
@@ -317,25 +345,108 @@ def _install_custom_op(module: torch.nn.Module) -> bool:
                 or getattr(module, "_full_precision_mm", False)
                 or weight._qdata.device != x.device):
             return original(x, *args, **kwargs)
-        qweight, wscales = get_plain(weight)
         bias = module.bias
         if bias is not None and bias.dtype != x.dtype:
             bias = bias.to(dtype=x.dtype)
-        # The op exists for Dynamo's benefit; an eager call gains nothing from routing
-        # through `torch.library` and can skip that dispatch. `is_compiling()` is
-        # constant-folded during tracing, so the compiled graph still gets the op node --
-        # the same mechanism ComfyUI uses to keep `run_every_op` out of compiled graphs
-        # (`comfy/ops.py`). Measured either way it is within noise in eager; what the
-        # memoized `_resolve_impl` below is worth is not (0.846 -> 0.833 s/step on a 3090 at
-        # 1024px, rank 256, against `KREA2_W4A4_OP=0`).
         if torch.compiler.is_compiling():
-            return op(x, qweight, wscales, bias, groupsize, quant_group_size, linear_dtype)
-        impl = _resolve_impl(x, qweight, wscales, bias, groupsize, quant_group_size,
-                             linear_dtype)
-        return impl(x, qweight, wscales, bias=bias, convrot_groupsize=groupsize,
-                    quant_group_size=quant_group_size, linear_dtype=linear_dtype)
+            return op_call(x, bias)
+        return eager_call(x, bias)
 
-    module.forward = forward
+    return forward
+
+
+def _install_custom_op(module: torch.nn.Module) -> bool:
+    """Route this Linear's matmul through a `krea2::` kernel op. True if it took.
+
+    Handles the two convrot layouts this pack writes -- `convrot_w4a4` and
+    `asym_w4a8_int8` -- each behind its own registered op, so a torch.compiled step keeps
+    the layer inside the graph instead of breaking at the kernel.
+
+    `params.transposed` is checked once here rather than per call: a transposed weight makes
+    kitchen dequantize and run a bf16 linear, which is a different computation, not a slower
+    one. A checkpoint whose weights arrive transposed should keep whatever kitchen does with
+    it.
+    """
+    # An escape hatch, and the only honest way to A/B this: the two paths cannot coexist in
+    # one process, so the comparison is one server run against another, and a flag is what
+    # makes those two runs differ by exactly this decision. Disables both layout ops.
+    if os.environ.get("KREA2_W4A4_OP") == "0":
+        return False
+    # Idempotent: the loader installs this at load time, the compile-prep node can be asked
+    # to do it again on a model that already has it, and wrapping a wrapper would put the
+    # guard block on the hot path twice for no benefit.
+    if getattr(module, "_krea2_op_installed", False):
+        return True
+
+    try:
+        params = module.weight._params
+        if params.transposed:
+            return False
+        convrot_groupsize = int(params.convrot_groupsize)
+        if hasattr(params, "linear_dtype"):  # W4A4
+            op = _w4a4_op()
+            if op is None:
+                return False
+            from comfy_kitchen.tensor.convrot_w4a4 import TensorCoreConvRotW4A4Layout
+            get_plain = TensorCoreConvRotW4A4Layout.get_plain_tensors
+            quant_group_size = int(params.quant_group_size)
+            linear_dtype = str(params.linear_dtype)
+
+            def op_call(x, bias):
+                qweight, wscales = get_plain(module.weight)
+                return op(x, qweight, wscales, bias, convrot_groupsize, quant_group_size,
+                          linear_dtype)
+
+            def eager_call(x, bias):
+                qweight, wscales = get_plain(module.weight)
+                impl = _resolve_impl("convrot_w4a4_linear", (
+                    x.dtype, x.device, x.ndim, qweight.dtype, wscales.dtype,
+                    None if bias is None else bias.dtype,
+                    convrot_groupsize, quant_group_size, linear_dtype), {
+                    "x": x, "qweight": qweight, "wscales": wscales, "bias": bias,
+                    "convrot_groupsize": convrot_groupsize,
+                    "quant_group_size": quant_group_size, "linear_dtype": linear_dtype,
+                })
+                return impl(x, qweight, wscales, bias=bias,
+                            convrot_groupsize=convrot_groupsize,
+                            quant_group_size=quant_group_size, linear_dtype=linear_dtype)
+        else:  # W4A8
+            op = _w4a8_op()
+            if op is None:
+                return False
+            from comfy_kitchen.tensor.w4a8_int8 import AsymW4A8Int8Layout
+            get_plain = AsymW4A8Int8Layout.get_plain_tensors
+            group_size = int(params.group_size)
+            out_dtype = str(params.orig_dtype).removeprefix("torch.")
+
+            def op_call(x, bias):
+                qdata, s_rel, s_channel, correction, codebook = get_plain(module.weight)
+                return op(x, qdata, s_rel, s_channel, codebook, correction, bias,
+                          group_size, convrot_groupsize, out_dtype)
+
+            def eager_call(x, bias):
+                qdata, s_rel, s_channel, correction, codebook = get_plain(module.weight)
+                impl = _resolve_impl("w4a8_int8_linear", (
+                    x.dtype, x.device, x.ndim, qdata.dtype, s_rel.dtype, s_channel.dtype,
+                    None if codebook is None else codebook.dtype,
+                    None if correction is None else correction.dtype,
+                    None if bias is None else bias.dtype,
+                    group_size, convrot_groupsize, out_dtype), {
+                    "x": x, "qdata": qdata, "s_rel": s_rel, "s_channel": s_channel,
+                    "codebook": codebook, "correction": correction, "bias": bias,
+                    "group_size": group_size, "convrot_groupsize": convrot_groupsize,
+                    "out_dtype": getattr(torch, out_dtype),
+                })
+                return impl(x, qdata, s_rel, s_channel, codebook=codebook,
+                            correction=correction, bias=bias, group_size=group_size,
+                            convrot_groupsize=convrot_groupsize,
+                            out_dtype=getattr(torch, out_dtype))
+    except Exception as exc:
+        logging.debug("[krea2-svdquant] cannot read layout params off %s: %s",
+                      type(module).__name__, exc)
+        return False
+
+    module.forward = _op_forward(module, op_call, eager_call)
     module._krea2_op_installed = True
     return True
 
@@ -448,13 +559,14 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
     if not compile_safe:
         compile_desc = "compile shielding off"
     elif via_op == attached:
-        compile_desc = "compile: {} layers in-graph via krea2::w4a4_linear".format(via_op)
+        compile_desc = "compile: {} layers in-graph via the krea2 compile op".format(via_op)
     elif via_op:
         compile_desc = "compile: {} layers in-graph, {} as graph breaks".format(
             via_op, attached - via_op)
     else:
+        op_error = _W4A4_OP_ERROR or _W4A8_OP_ERROR
         compile_desc = "compile: all {} layers are graph breaks{}".format(
-            attached, " ({})".format(_W4A4_OP_ERROR) if _W4A4_OP_ERROR else "")
+            attached, " ({})".format(op_error) if op_error else "")
     summary = ("{} + low-rank: attached {} branches (rank {}, variant {}), "
                "model_size {:.2f} GiB, {}".format(
                    base_fmt, attached, rank_desc, variant,
