@@ -114,12 +114,12 @@ class Krea2SVDQuantQuantize:
                 "act_stats": ("STRING", {
                     "default": "",
                     "tooltip": "svdq/svdq8 only: an activation-statistics file from the Capture "
-                               "nodes (a bare filename is looked up in ComfyUI/output/). "
+                               "nodes (a bare filename is looked up in ComfyUI/output/svdq_act_stats/). "
                                "Fits the low-rank branch against measured per-channel "
                                "activation energy instead of assuming it is uniform. Free at "
                                "inference and the best-measured setting here - LPIPS to BF16 "
                                "0.3378 to 0.2825 with no LoRA. Leave empty to auto-detect "
-                               "{source_name}_act_stats.safetensors in ComfyUI/output/.",
+                               "{source_name}_act_stats.safetensors in ComfyUI/output/svdq_act_stats/.",
                 }),
                 # Appended after act_stats rather than inserted among the required inputs:
                 # ComfyUI matches widgets_values positionally, so anywhere else would shift
@@ -214,7 +214,7 @@ class Krea2SVDQuantQuantize:
         if not stats_path:
             # Auto-derive from source model name: Beauty_Model_v10 → Beauty_Model_v10_act_stats.safetensors
             derived = os.path.splitext(os.path.basename(src))[0] + "_act_stats.safetensors"
-            derived_full = os.path.join(folder_paths.get_output_directory(), derived)
+            derived_full = os.path.join(folder_paths.get_output_directory(), "svdq_act_stats", derived)
             stats_path = derived_full if os.path.isfile(derived_full) else None
         if stats_path is not None:
             if format not in ("svdq", "svdq8"):
@@ -222,7 +222,7 @@ class Krea2SVDQuantQuantize:
                                    "the low-rank branch, and the other formats have no "
                                    "branch.")
             if not os.path.isabs(stats_path):
-                stats_path = os.path.join(folder_paths.get_output_directory(), stats_path)
+                stats_path = os.path.join(folder_paths.get_output_directory(), "svdq_act_stats", stats_path)
             if not os.path.isfile(stats_path):
                 raise RuntimeError("act_stats file not found: {}".format(stats_path))
 

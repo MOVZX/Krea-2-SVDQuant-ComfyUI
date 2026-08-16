@@ -225,7 +225,7 @@ class Krea2SVDQuantCaptureSave:
                                                  "what forces the node to run *after* "
                                                  "sampling rather than before it."}),
                 "filename": ("STRING", {"default": "",
-                                        "tooltip": "Filename written under ComfyUI/output/. "
+                                        "tooltip": "Filename written under ComfyUI/output/svdq_act_stats/. "
                                                    "Leave empty to auto-derive from the model "
                                                    "loaded in Capture Start "
                                                    "(e.g. Beauty_Model_v10_act_stats.safetensors)."}),
@@ -248,7 +248,7 @@ class Krea2SVDQuantCaptureSave:
     FUNCTION = "save"
     CATEGORY = _CATEGORY
     TITLE = "Krea2 SVDQuant Capture Save"
-    DESCRIPTION = ("Writes the captured activation RMS to ComfyUI/output/. Must be "
+    DESCRIPTION = ("Writes the captured activation RMS to ComfyUI/output/svdq_act_stats/. Must be "
                    "downstream of the KSampler.")
 
     @classmethod
@@ -260,7 +260,7 @@ class Krea2SVDQuantCaptureSave:
             filename = _SOURCE_MODEL_STEM + "_act_stats.safetensors"
         elif not filename.strip():
             filename = "krea2_act_stats.safetensors"
-        path = os.path.join(folder_paths.get_output_directory(), filename)
+        path = os.path.join(folder_paths.get_output_directory(), "svdq_act_stats", filename)
         info = write(path)
         if not keep_capturing:
             detach()

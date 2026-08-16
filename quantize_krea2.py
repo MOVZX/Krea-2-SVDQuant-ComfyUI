@@ -1036,19 +1036,19 @@ def main():
         if not os.path.exists(args.act_stats):
             raise SystemExit("--act-stats file not found: {}".format(args.act_stats))
     else:
-        # Auto-detect: {source_name}_act_stats.safetensors di ComfyUI/output/
+        # Auto-detect: {source_name}_act_stats.safetensors di ComfyUI/output/svdq_act_stats/
         derived = os.path.splitext(os.path.basename(args.src))[0] + "_act_stats.safetensors"
         comfy_root = _find_comfyui_root()
         if comfy_root:
-            candidate = os.path.join(comfy_root, "output", derived)
+            candidate = os.path.join(comfy_root, "output", "svdq_act_stats", derived)
             if os.path.isfile(candidate):
                 args.act_stats = candidate
 
     if not args.act_stats:
         stem = os.path.splitext(os.path.basename(args.src))[0]
-        expected = stem + "_act_stats.safetensors"
+        expected = os.path.join("svdq_act_stats", stem + "_act_stats.safetensors")
         raise SystemExit(
-            f"act_stats file not found: {expected}\n"
+            f"act_stats file not found under ComfyUI/output/{expected}\n"
             f"Run the Krea2 SVDQuant Capture nodes first to generate it."
         )
 
