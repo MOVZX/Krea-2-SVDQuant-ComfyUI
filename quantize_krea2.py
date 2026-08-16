@@ -174,8 +174,8 @@ def _free_comfyui_memory() -> None:
     print("warning: could not reach ComfyUI to unload models. GPU memory may be limited.")
 
 
-def _select_model() -> str:
-    """Interactive model selector: list eligible models, return full path."""
+def _select_model() -> tuple[str, str]:
+    """Interactive model selector: list eligible models, return (path, source kind)."""
     comfy_root = _find_comfyui_root()
     if not comfy_root:
         raise SystemExit("Cannot find ComfyUI root. Set COMFYUI_PATH or run from inside ComfyUI.")
@@ -222,10 +222,31 @@ def _select_model() -> str:
         try:
             idx = int(choice) - 1
             if 0 <= idx < len(candidates):
-                return candidates[idx][0]
+                return candidates[idx]
         except ValueError:
             pass
         print("Invalid choice. Pick 1-{}.".format(len(candidates)))
+
+
+def _select_format(source_kind: str) -> str:
+    """Interactive format selector, shown right after the model pick.
+
+    Only the two SVDQuant formats are offered: the CLI requires activation
+    stats either way, and those are the formats the stats actually feed.
+    """
+    print("\nQuantization format:")
+    print("  1. svdq8  W4A8 + low-rank branch (default)")
+    if source_kind == "fp8":
+        print("  2. svdq   W4A4 + low-rank branch (fastest, worst on FP8 sources)")
+    else:
+        print("  2. svdq   W4A4 + low-rank branch (fastest)")
+    while True:
+        choice = input("Select format [1]: ").strip() or "1"
+        if choice in ("1", "svdq8"):
+            return "svdq8"
+        if choice in ("2", "svdq"):
+            return "svdq"
+        print("Invalid choice. Pick 1 or 2.")
 
 
 def detect_prefix(keys, default: str | None = None) -> str:
@@ -1024,7 +1045,9 @@ def main():
     args = ap.parse_args()
 
     if args.src is None:
-        args.src = _select_model()
+        args.src, src_kind = _select_model()
+        if args.format == ap.get_default("format"):
+            args.format = _select_format(src_kind)
 
     # Free GPU memory from any running ComfyUI session
     _free_comfyui_memory()
