@@ -78,38 +78,15 @@ STEPS_HI = 24
 ARMS = {
     "bf16": {
         "node": "UNETLoader",
-        "inputs": {"unet_name": "turbo.safetensors", "weight_dtype": "default"},
+        "inputs": {"unet_name": "Krea-2/cielbleuKrea2_v1.safetensors", "weight_dtype": "default"},
     },
-    "int8": {
-        "node": "OTUNetLoaderW8A8",
-        "inputs": {"unet_name": "krea2turboint8convrot.safetensors",
-                   "weight_dtype": "default", "model_type": "qwen",
-                   "on_the_fly_quantization": False, "enable_convrot": True,
-                   "lora_mode": "None"},
-    },
-    "nolowrank": {
-        "node": "UNETLoader",
-        "inputs": {"unet_name": "Krea2-Turbo-W4A4-noLowRank.safetensors",
-                   "weight_dtype": "default"},
-    },
-    "r256aa": {
+    "svdq": {
         "node": "Krea2SVDQuantW4A4Loader",
-        "inputs": {"model_name": "Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors"},
+        "inputs": {"model_name": "Krea-2/SVDQuant/cielbleuKrea2_v1-SVDQuant-W4A4-rank256-actaware.safetensors"},
     },
-    # The rank sweep exists to price the low-rank branch. `--act-stats` cannot change any of
-    # these numbers -- same shapes, same kernels, only different values inside the factors --
-    # so the plain builds stand in for their act-aware equivalents.
-    "r16": {
+    "svdq8": {
         "node": "Krea2SVDQuantW4A4Loader",
-        "inputs": {"model_name": "Krea2-Turbo-SVDQuant-W4A4-rank16.safetensors"},
-    },
-    "r64": {
-        "node": "Krea2SVDQuantW4A4Loader",
-        "inputs": {"model_name": "Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors"},
-    },
-    "r128": {
-        "node": "Krea2SVDQuantW4A4Loader",
-        "inputs": {"model_name": "Krea2-Turbo-SVDQuant-W4A4-rank128.safetensors"},
+        "inputs": {"model_name": "Krea-2/SVDQuant/cielbleuKrea2_v1-SVDQuant-W4A8-rank256-actaware.safetensors"},
     },
 }
 
@@ -147,6 +124,28 @@ def build_graph(arm: str, steps: int, compile_backend: str | None, seed: int) ->
                    "inputs": {"model": ["1", 0], "backend": compile_backend}}
         g["7"]["inputs"]["model"] = ["11", 0]
     return g
+
+
+def free_memory(server: str) -> None:
+    """Unload whatever is resident before a model switch, so each arm starts clean.
+
+    The stock flow just lets ComfyUI evict the previous arm's model under memory
+    pressure during the load; freeing explicitly makes the starting VRAM state the
+    same for every arm.
+    """
+    try:
+        # /free answers with an empty body on current ComfyUI, so this posts directly
+        # instead of going through fb._post, which parses JSON.
+        req = urllib.request.Request(
+            server + "/free",
+            data=json.dumps({"unload_models": True, "free_memory": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=30).read()
+    except (urllib.error.URLError, ConnectionRefusedError, OSError):
+        print("warning: could not reach {} /free; a model resident from the UI will bias "
+              "the first arm".format(server), flush=True)
 
 
 def check_nodes(server: str, arms: list[str], want_compile: bool) -> list[str]:
@@ -230,12 +229,15 @@ def measure(server: str, arm: str, compile_backend: str | None, reps: int,
     """
     samples: dict[int, list[float]] = {}
     for steps in (STEPS_LO, STEPS_HI):
+        print("    {:>2} steps: warmup (discarded)".format(steps), flush=True)
         time_run(server, arm, steps, compile_backend, timeout)  # warmup, discarded
-        runs = [time_run(server, arm, steps, compile_backend, timeout) for _ in range(reps)]
+        runs = []
+        for i in range(reps):
+            secs = time_run(server, arm, steps, compile_backend, timeout)
+            runs.append(secs)
+            print("    {:>2} steps: [{}/{}] {:.2f}s".format(steps, i + 1, reps, secs), flush=True)
         samples[steps] = runs
-        print("    {:>2} steps: {}  median {:.2f}s".format(
-            steps, " ".join("{:.2f}".format(r) for r in runs), statistics.median(runs)),
-            flush=True)
+        print("    {:>2} steps: median {:.2f}s".format(steps, statistics.median(runs)), flush=True)
 
     lo = statistics.median(samples[STEPS_LO])
     hi = statistics.median(samples[STEPS_HI])
@@ -277,6 +279,7 @@ def main() -> int:
 
     results = []
     for arm in args.arms:
+        free_memory(args.server)
         for mode in args.compile:
             print("{} / compile={}".format(arm, mode), flush=True)
             t0 = time.time()

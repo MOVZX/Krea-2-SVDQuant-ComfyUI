@@ -72,8 +72,8 @@ SCHEDULER = "simple"
 WIDTH = 1024
 HEIGHT = 1024
 
-CLIP_NAME = "qwen3vl_4b_fp8_scaled.safetensors"
-VAE_NAME = "qwen_image_vae.safetensors"
+CLIP_NAME = "Krea-2/qwen3vl_4b_fp8_scaled.safetensors"
+VAE_NAME = "Krea-2/qwen_image_vae.safetensors"
 LORA_STRENGTH = 1.0
 
 # An "arm" is one LoRA configuration, `base` being none. Each is scored against its *own*
@@ -110,20 +110,9 @@ ARM_LORA = {
 # LoRA to a quantized weight through the stock path means dequantize -> add -> requantize,
 # which re-quantizes the LoRA delta to 4 bits, so quantized files go through this repo's node.
 CHECKPOINTS_TURBO = {
-    "bf16":      {"file": "turbo.safetensors",                            "loader": "unet", "quantized": False},
-    "nolowrank": {"file": "Krea2-Turbo-W4A4-noLowRank.safetensors",       "loader": "unet", "quantized": True},
-    "r16":       {"file": "Krea2-Turbo-SVDQuant-W4A4-rank16.safetensors", "loader": "svdq", "quantized": True},
-    "r64":       {"file": "Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors", "loader": "svdq", "quantized": True},
-    "r128":      {"file": "Krea2-Turbo-SVDQuant-W4A4-rank128.safetensors","loader": "svdq", "quantized": True},
-    "r256":      {"file": "Krea2-Turbo-SVDQuant-W4A4-rank256.safetensors","loader": "svdq", "quantized": True},
-    # Same rank, same size, same kernel -- built with --act-stats so the low-rank split is
-    # weighted by measured activation RMS instead of plain weight magnitude.
-    "r256aa":    {"file": "Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", "loader": "svdq", "quantized": True},
-    # Same build as r256aa except the activation statistics were captured with `lora2`
-    # loaded. BENCHMARKS.md's open question is whether act-aware goes null under a LoRA
-    # because the calibration saw no adapter; this arm is what answers it, and it is only
-    # meaningful when scored on the `lora2` arm it was calibrated for.
-    "r256aal2":  {"file": "Krea2-Turbo-SVDQuant-W4A4-rank256-actaware-lora2.safetensors", "loader": "svdq", "quantized": True},
+    "bf16":      {"file": "Krea-2/cielbleuKrea2_v1.safetensors",          "loader": "unet", "quantized": False},
+    "svdq":      {"file": "Krea-2/SVDQuant/cielbleuKrea2_v1-SVDQuant-W4A4-rank256-actaware.safetensors", "loader": "svdq", "quantized": True},
+    "svdq8":     {"file": "Krea-2/SVDQuant/cielbleuKrea2_v1-SVDQuant-W4A8-rank256-actaware.safetensors", "loader": "svdq", "quantized": True},
 }
 
 CHECKPOINTS_BASE = {
