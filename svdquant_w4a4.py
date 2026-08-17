@@ -588,7 +588,8 @@ class Krea2SVDQuantW4A4Loader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_name": (folder_paths.get_filename_list("diffusion_models"), {
+                "model_name": ([f for f in folder_paths.get_filename_list("diffusion_models")
+                                if f.startswith("Krea-2/SVDQuant/")], {
                     "tooltip": "A checkpoint from quantize_krea2.py --format svdq or svdq8 "
                                "(it carries *.svdq_l1/*.svdq_l2 tensors). The --format "
                                "w4a4 / w4a8 / int8 / fp8 checkpoints have no branch and load "

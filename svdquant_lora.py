@@ -279,7 +279,8 @@ class Krea2SVDQuantLoraLoader:
                     "tooltip": "Output of the Krea2 SVDQuant Loader, or any Krea2 checkpoint "
                                "with convrot-quantized (W4A4 / W4A8) blocks.",
                 }),
-                "lora_name": (folder_paths.get_filename_list("loras"), {
+                "lora_name": ([f for f in folder_paths.get_filename_list("loras")
+                               if f.startswith("Krea-2/")], {
                     "tooltip": "A Krea2 LoRA. Targets 'blocks.N.{attn,mlp}.*' under either "
                                "prefix ('diffusion_model.' or 'transformer.') for the "
                                "quantized blocks; anything else it carries (txtfusion "
