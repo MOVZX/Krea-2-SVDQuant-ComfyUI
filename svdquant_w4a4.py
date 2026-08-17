@@ -28,6 +28,8 @@ import folder_paths
 from .quantize_krea2 import detect_prefix
 from .sage_mask_guard import install_mask_guard
 from .svdquant_diag import BUF_L1, BUF_L2, _CATEGORY, branch_factors, log_dispatch  # noqa: F401
+from .svdquant_fast_branch import make_applier as _make_fast_applier
+from .svdquant_fast_branch import status as _fast_branch_status
 
 # The checkpoint keys are the buffer names with a dot in front -- derived rather than
 # retyped, because the two being identical is the property the round-trip depends on.
@@ -116,19 +118,62 @@ def attach_branch(module: torch.nn.Module, l1: torch.Tensor, l2: torch.Tensor,
     _publish_in_state_dict(module)
 
     original = module.forward
+    # The fused branch is a per-call decision, not a load-time one: the factors may be
+    # staged by ComfyUI's offload machinery after this runs, so a call that finds them
+    # anywhere other than the input takes the stock path. Same conditions `_op_forward`
+    # re-checks for the quantized kernel.
+    fast = _make_fast_applier()
 
     def forward(x, *args, **kwargs):
         y = original(x, *args, **kwargs)
         factors = branch_factors(module)
         if factors is None:
             return y
-        return add_low_rank(y, x, *factors)
+        l1, l2 = factors
+        if fast is not None and x.ndim >= 2 and x.is_contiguous() \
+                and x.device.type == "cuda" \
+                and l1.device == x.device and l1.dtype == x.dtype \
+                and y.is_contiguous() and y.dtype == x.dtype:
+            return fast(x, y, l1, l2)
+        if fast is not None and _SLOW_FALLBACK_LOGS["count"] < 3:
+            _SLOW_FALLBACK_LOGS["count"] += 1
+            logging.info("[krea2-svdquant] fast branch fell back to add_low_rank "
+                         "(%s); logging the first 3 occurrences only",
+                         _fallback_reason(x, y, l1))
+        return add_low_rank(y, x, l1, l2)
 
     module.forward = forward
     # Kept as a stable handle so a LoRA can build on top of "quantized weight + svdq
     # branch" without having to trust whatever is currently in `module.forward` -- which
     # ComfyUI's object-patch machinery swaps in and out around sampling.
     module._krea2_forward = forward
+
+
+_SLOW_FALLBACK_LOGS = {"count": 0}
+
+
+def _fallback_reason(x, y, l1) -> str:
+    """Which per-call condition sent this forward to `add_low_rank`.
+
+    The first three fallbacks are logged with this answer: a fast branch that
+    silently never runs looks exactly like one that runs and does not help, and
+    only the condition that failed distinguishes the two.
+    """
+    if x.ndim < 2:
+        return "x is {}D".format(x.ndim)
+    if not x.is_contiguous():
+        return "x not contiguous"
+    if x.device.type != "cuda":
+        return "x on {}".format(x.device.type)
+    if l1.device != x.device:
+        return "factors on {}, input on {}".format(l1.device.type, x.device.type)
+    if l1.dtype != x.dtype:
+        return "factor dtype {} != input {}".format(l1.dtype, x.dtype)
+    if not y.is_contiguous():
+        return "y not contiguous"
+    if y.dtype != x.dtype:
+        return "y dtype {} != input {}".format(y.dtype, x.dtype)
+    return "unknown"
 
 
 def _get_submodule(root: torch.nn.Module, dotted: str) -> torch.nn.Module:
@@ -574,12 +619,13 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
     logging.info("[krea2-svdquant] %s", summary)
 
     dispatch = log_dispatch(diffusion_model)
+    fast_status = _fast_branch_status()
 
     # Stashed rather than returned so callers that just want the model (diagnose.py, the
     # head-to-head scripts) keep working unchanged. The node surfaces it in the UI, which
     # matters most for the dispatch warning: buried in the console, the people who most need
     # to read it are exactly the ones who never see it.
-    patcher.krea2_load_summary = "\n".join(x for x in (summary, dispatch) if x)
+    patcher.krea2_load_summary = "\n".join(x for x in (summary, dispatch, fast_status) if x)
     return patcher
 
 
