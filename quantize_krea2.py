@@ -216,16 +216,22 @@ def _select_model() -> tuple[str, str]:
         size_gb = os.path.getsize(path) / 1024 ** 3
         tag = "  [FP8 source - use w4a8/svdq8]" if kind == "fp8" else ""
         print("  {}. {} ({:.1f} GB){}".format(i, os.path.basename(path), size_gb, tag))
+    print("  0. Exit")
 
     while True:
-        choice = input("Select model (number): ").strip()
+        choice = input("Select model (number, 0 to exit): ").strip()
+
+        # Handle exit conditions
+        if choice == "0" or choice == "":
+            raise SystemExit("Selection cancelled.")
+
         try:
             idx = int(choice) - 1
             if 0 <= idx < len(candidates):
                 return candidates[idx]
         except ValueError:
             pass
-        print("Invalid choice. Pick 1-{}.".format(len(candidates)))
+        print("Invalid choice. Pick 1-{} or 0 to exit.".format(len(candidates)))
 
 
 def _select_format(source_kind: str) -> str:
@@ -247,6 +253,23 @@ def _select_format(source_kind: str) -> str:
         if choice in ("2", "svdq"):
             return "svdq"
         print("Invalid choice. Pick 1 or 2.")
+
+
+def _select_rank() -> int:
+    """Interactive rank selector, shown right after the format pick."""
+    print("\nLow-rank branch rank:")
+    print("  1. 64   smallest branch -- enough without a LoRA")
+    print("  2. 128  middle ground")
+    print("  3. 256  best with a LoRA loaded (default)")
+    while True:
+        choice = input("Select rank [3]: ").strip() or "3"
+        if choice in ("1", "64"):
+            return 64
+        if choice in ("2", "128"):
+            return 128
+        if choice in ("3", "256"):
+            return 256
+        print("Invalid choice. Pick 1, 2, or 3.")
 
 
 def detect_prefix(keys, default: str | None = None) -> str:
@@ -1053,6 +1076,8 @@ def main():
         args.src, src_kind = _select_model()
         if args.format == ap.get_default("format"):
             args.format = _select_format(src_kind)
+        if args.rank == ap.get_default("rank") and args.format in ("svdq", "svdq8"):
+            args.rank = _select_rank()
 
     # Free GPU memory from any running ComfyUI session
     _free_comfyui_memory()
