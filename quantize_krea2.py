@@ -297,6 +297,13 @@ def check_requantizable(handle, keys, prefix: str) -> None:
     dequantize back to BF16 (see `_DEQUANTIZABLE_FORMATS`). Anything else -- most
     importantly INT8/W4A4 -- needs the original BF16 (or FP16) release instead.
     """
+    def reject(layer, fmt):
+        raise RuntimeError(
+            "Layer {} is already quantized as '{}'. Only FP8-quantized layers can be "
+            "automatically reconstructed and re-quantized; for INT8/W4A4 sources, use "
+            "the original BF16 (or FP16) release of the model instead.".format(layer, fmt)
+        )
+
     for key in keys:
         if not key.endswith(".comfy_quant"):
             continue
@@ -304,13 +311,15 @@ def check_requantizable(handle, keys, prefix: str) -> None:
         if not is_target(layer, prefix):
             continue
         conf = json.loads(bytes(handle.get_tensor(key).tolist()))
-        fmt = conf.get("format")
-        if fmt not in _DEQUANTIZABLE_FORMATS:
-            raise RuntimeError(
-                "Layer {} is already quantized as '{}'. Only FP8-quantized layers can be "
-                "automatically reconstructed and re-quantized; for INT8/W4A4 sources, use "
-                "the original BF16 (or FP16) release of the model instead.".format(layer, fmt)
-            )
+        if conf.get("format") not in _DEQUANTIZABLE_FORMATS:
+            reject(layer, conf.get("format"))
+    # Marker-less sources keep the per-layer formats in __metadata__._quantization_metadata
+    # instead of on the tensors, so the same check has to run against that too.
+    qmeta = (handle.metadata() or {}).get("_quantization_metadata")
+    if qmeta:
+        for layer, conf in json.loads(qmeta).get("layers", {}).items():
+            if is_target(layer, prefix) and conf.get("format") not in _DEQUANTIZABLE_FORMATS:
+                reject(layer, conf.get("format"))
 
 
 def dequantize_target_weight(handle, layer: str, device: str) -> torch.Tensor:
