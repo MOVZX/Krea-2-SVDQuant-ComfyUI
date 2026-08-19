@@ -53,6 +53,8 @@ DISABLED = os.environ.get("KREA2_FAST_BRANCH") == "0"
 # g1 is "cublas" | "triton" and g2 is "triton" | "addmm" | "mm_add".
 _PLAN: dict[tuple, tuple[str, str]] = {}
 
+_SM_BUDGET: dict[str, int | None] = {}
+_TFITS: dict[tuple, bool] = {}
 _OP = None
 _OP_ERROR = ""
 
@@ -101,6 +103,57 @@ if _TRITON_IMPORT:
 
 def _pow2(n: int, lo: int = 16, hi: int = 128) -> int:
     return min(max(triton.next_power_of_2(n), lo), hi)
+
+
+def _smem_budget(device) -> int | None:
+    """Shared memory per Triton block on this device, cached. None = unknown."""
+    key = str(device)
+    if key not in _SM_BUDGET:
+        try:
+            _SM_BUDGET[key] = int(
+                torch.cuda.get_device_properties(device).shared_memory_per_block_optin)
+        except Exception:
+            _SM_BUDGET[key] = None
+    return _SM_BUDGET[key]
+
+
+def _triton_usable(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether `_launch`'s fixed tile fits this device's shared memory.
+
+    Tiles grow with rank; at rank 256 the pipeline exceeds the 99 KB per-block
+    limit on Ampere and the Triton launch raises OutOfResources mid-bench, which
+    kills the prompt. cuBLAS takes over in that case.
+
+    A shared-memory formula is not a reliable way to tell: Triton's own staging
+    does not follow it (the rank 256 launch asked for exactly 131072 B where the
+    formula said ~426 KB), and an over-estimate at rank 64 -- where Triton wins
+    the bench by 1.3-1.7x -- costs real step time. So the formula is only a
+    pre-screen; the verdict is a one-time probe launch of the real kernel at a
+    tiny token count, cached per tile config.
+    """
+    if not _TRITON_IMPORT:
+        return False
+    M, K = a.shape
+    N = b.shape[0]
+    bn = _pow2(N)
+    bk = _pow2(min(K, N)) if K < N else 64
+    key = (str(a.device), K, N, a.dtype)
+    hit = _TFITS.get(key)
+    if hit is not None:
+        return hit
+    budget = _smem_budget(a.device)
+    fits = budget is None or (128 * bk + bk * bn) * 2 * 3 <= budget
+    if fits:
+        try:
+            pm = min(M, 16)
+            pa = torch.zeros(pm, K, device=a.device, dtype=a.dtype)
+            pc = torch.zeros(pm, N, device=a.device, dtype=a.dtype)
+            _launch(pa, b, pc, pc)
+        except Exception as exc:
+            fits = "OutOfResources" in type(exc).__name__ or \
+                "shared memory" in str(exc)
+    _TFITS[key] = fits
+    return fits
 
 
 def _launch(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor | None,
@@ -163,22 +216,28 @@ def _bench_plan(x, y, l1, l2) -> tuple[tuple[str, str], dict]:
     out = torch.empty(M, N, device=x.device, dtype=x.dtype)
     tmp = torch.empty(M, N, device=x.device, dtype=x.dtype)
 
-    _triton_gemm1(x, l2, h)  # first call compiles; the rounds below time it warm
     g1_cands = [
         ("cublas", lambda: torch.mm(x, l2.t(), out=h)),
-        ("triton", lambda: _triton_gemm1(x, l2, h)),
     ]
+    if _triton_usable(x, l2):
+        # first call compiles; the rounds below time it warm
+        _triton_gemm1(x, l2, h)
+        g1_cands.append(("triton", lambda: _triton_gemm1(x, l2, h)))
+    # g2's probe may compile its kernel variant here, before any timing round.
+    _triton_usable(h, l1)
     g1, g1_times = _pick_timed(g1_cands)
 
     def mm_add():
         torch.mm(h, l1.t(), out=tmp)
         return tmp.add(y0)
 
-    g2, g2_times = _pick_timed([
-        ("triton", lambda: _triton_gemm2(h, l1, y0, out)),
+    g2_cands = [
         ("addmm", lambda: torch.addmm(y0, h, l1.t())),
         ("mm_add", mm_add),
-    ])
+    ]
+    if _triton_usable(h, l1):
+        g2_cands.insert(0, ("triton", lambda: _triton_gemm2(h, l1, y0, out)))
+    g2, g2_times = _pick_timed(g2_cands)
     return (g1, g2), {"g1": g1_times, "g2": g2_times}
 
 
@@ -208,16 +267,16 @@ def _branch_impl(x, y, l1, l2) -> torch.Tensor:
                      "/ mm_add %.3f ms)",
                      K, R, N, plan[0], plan[1],
                      g1t.get("triton", -1), g1t.get("cublas", -1),
-                     g2t["triton"], g2t["addmm"], g2t["mm_add"])
+                     g2t.get("triton", -1), g2t["addmm"], g2t["mm_add"])
     g1, g2 = plan
 
     M = m2.shape[0]
     h = torch.empty(M, R, device=x.device, dtype=x.dtype)
-    if g1 == "triton":
+    if g1 == "triton" and _triton_usable(m2, l2):
         _triton_gemm1(m2, l2, h)
     else:
         torch.mm(m2, l2.t(), out=h)
-    if g2 == "triton":
+    if g2 == "triton" and _triton_usable(h, l1):
         out = torch.empty(M, N, device=x.device, dtype=x.dtype)
         _triton_gemm2(h, l1, y2, out)
         return out.reshape(y.shape)
