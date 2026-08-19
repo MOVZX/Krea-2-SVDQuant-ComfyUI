@@ -930,6 +930,22 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
         "krea2_svdquant_seed": "" if seed is None else str(seed),
         "krea2_svdquant_device": str(device),
     }
+    # Marker-less scaled FP8 sources keep their quantization config in
+    # __metadata__._quantization_metadata; ComfyUI's loader injects the per-layer
+    # markers from it. Carry it over, trimmed to the layers that are still fp8 in
+    # this file -- quantized targets carry their own markers and would be misread
+    # as fp8 -- otherwise their pass-through weight_scale tensors load unscaled.
+    with open(src, "rb") as f:
+        (hn,) = struct.unpack("<Q", f.read(8))
+        qmeta = json.loads(f.read(hn)).get("__metadata__", {}).get("_quantization_metadata")
+    if qmeta:
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2,
+                      torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
+        layers = {k: v for k, v in json.loads(qmeta).get("layers", {}).items()
+                  if isinstance(out.get("{}.weight".format(k)), torch.Tensor)
+                  and out["{}.weight".format(k)].dtype in fp8_dtypes}
+        if layers:
+            metadata["_quantization_metadata"] = json.dumps({"layers": layers})
     if progress_cb is not None:
         progress_cb(quantized, _EXPECTED_LAYERS, "writing {:.2f} GB ...".format(
             sum(t.numel() * t.element_size() for t in out.values()) / 1024 ** 3))
