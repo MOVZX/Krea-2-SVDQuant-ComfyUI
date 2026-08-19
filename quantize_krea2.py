@@ -272,26 +272,6 @@ def _select_rank() -> int:
         print("Invalid choice. Pick 1, 2, or 3.")
 
 
-def _select_refine() -> tuple[int, float]:
-    """Interactive refinement selector, shown right after the rank pick.
-
-    Returns (refine_iters, refine_tol).
-    """
-    print("\nRefinement (refits the branch against the quantization error):")
-    print("  1. fast        ~9 iterations/layer, ~2x faster conversion")
-    print("  2. default     ~22 iterations/layer, ~2% less error than fast (default)")
-    print("  3. single-shot one SVD, ~54s total, ~10% more error -- not advised")
-    while True:
-        choice = input("Select refinement [2]: ").strip() or "2"
-        if choice in ("1", "fast"):
-            return 1000, 0.005
-        if choice in ("2", "default"):
-            return 1000, REFINE_TOL
-        if choice in ("3", "single-shot"):
-            return 0, REFINE_TOL
-        print("Invalid choice. Pick 1, 2, or 3.")
-
-
 def detect_prefix(keys, default: str | None = None) -> str:
     """Return the prefix the transformer blocks live under.
 
@@ -536,7 +516,7 @@ def _act_weighting(act_rms: torch.Tensor | None, in_features: int, device, floor
 
 
 def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
-                   refine_iters: int = 1000, act_rms: torch.Tensor | None = None,
+                   refine_iters: int = 100, act_rms: torch.Tensor | None = None,
                    refine_tol: float = REFINE_TOL, seed: int | None = None):
     """SVDQuant ordering: pull a low-rank bf16 branch out of W, quantize the residual.
 
@@ -774,7 +754,7 @@ def check_act_stats_coverage(stats: dict, keys, prefix: str, ranks: dict) -> Non
 
 
 def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", rank: int = 0,
-            refine_iters: int = 1000, variant: str = "unknown", progress_cb=None,
+            refine_iters: int = 100, variant: str = "unknown", progress_cb=None,
             rank_alloc: str = "uniform", act_stats: str | None = None,
             weight_patch=None, refine_tol: float = REFINE_TOL,
             seed: int | None = DEFAULT_SEED):
@@ -1061,7 +1041,7 @@ def main():
                          "uniform = same rank everywhere. gqa = byte-neutral reallocation "
                          "towards the GQA kv projections, which absorb ~2x the error at a "
                          "third of the branch cost (see RANK_ALLOCATIONS)")
-    ap.add_argument("--refine-iters", type=int, default=1000,
+    ap.add_argument("--refine-iters", type=int, default=100,
                     help="svdq only: refine the low-rank branch against the quantization "
                          "error, keeping the best (0 = plain single-shot SVD, much faster "
                          "but ~10%% more reconstruction error). This is a cap; --refine-tol "
@@ -1096,12 +1076,8 @@ def main():
         args.src, src_kind = _select_model()
         if args.format == ap.get_default("format"):
             args.format = _select_format(src_kind)
-        if args.format in ("svdq", "svdq8") and args.rank == ap.get_default("rank"):
+        if args.rank == ap.get_default("rank") and args.format in ("svdq", "svdq8"):
             args.rank = _select_rank()
-    if args.format in ("svdq", "svdq8") \
-            and (args.refine_iters == ap.get_default("refine_iters")
-                 and args.refine_tol == ap.get_default("refine_tol")):
-        args.refine_iters, args.refine_tol = _select_refine()
 
     # Free GPU memory from any running ComfyUI session
     _free_comfyui_memory()
