@@ -316,14 +316,15 @@ def check_requantizable(handle, keys, prefix: str) -> None:
 def dequantize_target_weight(handle, layer: str, device: str) -> torch.Tensor:
     """Load a target layer's weight as BF16, dequantizing it first if it's FP8.
 
-    Scaled FP8 (has a `comfy_quant` marker + `weight_scale`): ``qdata.float() * scale``.
-    Unscaled FP8 (a bare ``.to(float8_e4m3fn)`` cast, no marker): ``qdata`` as-is.
+    Scaled FP8 (a `weight_scale` sits next to the weight, marked either by a
+    `comfy_quant` key or by `__metadata__._quantization_metadata`): ``qdata.float() * scale``.
+    Unscaled FP8 (a bare ``.to(float8_e4m3fn)`` cast, no scale): ``qdata`` as-is.
     Anything else is already ruled out by `check_requantizable`.
     """
     weight = handle.get_tensor("{}.weight".format(layer)).to(device=device)
-    conf_key = "{}.comfy_quant".format(layer)
-    if conf_key in handle.keys():
-        scale = handle.get_tensor("{}.weight_scale".format(layer)).to(device=device).float()
+    scale_key = "{}.weight_scale".format(layer)
+    if scale_key in handle.keys():
+        scale = handle.get_tensor(scale_key).to(device=device).float()
         return (weight.to(torch.float32) * scale).to(torch.bfloat16)
     return weight.to(torch.bfloat16)
 
