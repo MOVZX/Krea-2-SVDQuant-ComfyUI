@@ -1055,6 +1055,15 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
     return os.path.join(os.path.dirname(src), "SVDQuant", "{}-{}.safetensors".format(stem, suffix)), note
 
 
+def _display_path(path: str) -> str:
+    """The path relative to ComfyUI's parent dir, so the header shows `ComfyUI/models/...`."""
+    root = _find_comfyui_root()
+    if root is None:
+        return path
+    rel = os.path.relpath(os.path.abspath(path), os.path.dirname(os.path.abspath(root)))
+    return path if rel.startswith("..") else rel
+
+
 def _fmt_elapsed(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
@@ -1178,13 +1187,14 @@ def main():
         return "{:<14} {}".format(label, value)
 
     lines = [
-        _hdr("Model:", args.src),
-        _hdr("Act. Stats:", args.act_stats or "none"),
-        _hdr("Format:", _FMT_LABELS[args.format]),
+        _hdr("Model         :", _display_path(args.src)),
+        _hdr("Act. Stats    :", _display_path(args.act_stats) if args.act_stats else "none"),
+        _hdr("Format        :", _FMT_LABELS[args.format]),
     ]
     if rank:
-        lines += [_hdr("Rank:", str(rank)), _hdr("Refine Iters:", str(args.refine_iters))]
-    lines.append(_hdr("Output:", out))
+        lines += [_hdr("Rank          :", str(rank)), _hdr("Refine Iters  :", str(args.refine_iters)),
+                  _hdr("Refine Tol    :", str(args.refine_tol))]
+    lines.append(_hdr("Output        :", _display_path(out)))
     print("\n".join(lines))
     print("---")
     if note:
