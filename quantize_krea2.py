@@ -986,6 +986,16 @@ _FORMAT_ALIASES = {
     "fp8": "float8_e4m3fn",
 }
 
+# What the CLI's start-of-run header shows for each format name.
+_FMT_LABELS = {
+    "svdq": "SVDQ (W4A4)",
+    "svdq8": "SVDQ8 (W4A8)",
+    "w4a4": "W4A4",
+    "w4a8": "W4A8",
+    "int8": "INT8",
+    "fp8": "FP8",
+}
+
 _GENERIC_STEMS = ("raw", "model", "diffusion_pytorch_model", "turbo")
 
 SAMPLER_HINTS = {
@@ -1045,6 +1055,14 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
     return os.path.join(os.path.dirname(src), "SVDQuant", "{}-{}.safetensors".format(stem, suffix)), note
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return "{}h {:02d}m {:02d}s".format(h, m, s)
+    return "{}m {:02d}s".format(m, s)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src", nargs="?", default=None,
@@ -1097,6 +1115,7 @@ def main():
                          "per weight whatever the seed. Pass -1 for the old unseeded "
                          "behaviour, where even two runs on one GPU differ")
     args = ap.parse_args()
+    t_start = time.time()
 
     if args.src is None:
         args.src, src_kind = _select_model()
@@ -1104,9 +1123,6 @@ def main():
             args.format = _select_format(src_kind)
         if args.rank == ap.get_default("rank") and args.format in ("svdq", "svdq8"):
             args.rank = _select_rank()
-
-    # Free GPU memory from any running ComfyUI session
-    _free_comfyui_memory()
 
     if args.no_low_rank:
         plain = {"svdq": "w4a4", "svdq8": "w4a8"}.get(args.format)
@@ -1151,11 +1167,28 @@ def main():
         raise SystemExit("--rank-alloc only applies to the svdq formats")
 
     out = args.out
+    note = None
     if out is None:
         out, note = derive_out_path(args.src, args.format, rank, args.variant, args.rank_alloc,
                                     args.act_stats)
-        if note:
-            print(note, flush=True)
+
+    # The header quotes the resolved values, not the raw arguments, so --no-low-rank
+    # and the act-stats auto-detect show up as what actually runs.
+    def _hdr(label, value):
+        return "{:<14} {}".format(label, value)
+
+    lines = [
+        _hdr("Model:", args.src),
+        _hdr("Act. Stats:", args.act_stats or "none"),
+        _hdr("Format:", _FMT_LABELS[args.format]),
+    ]
+    if rank:
+        lines += [_hdr("Rank:", str(rank)), _hdr("Refine Iters:", str(args.refine_iters))]
+    lines.append(_hdr("Output:", out))
+    print("\n".join(lines))
+    print("---")
+    if note:
+        print(note, flush=True)
 
     def cli_progress(done, total, message):
         pct = done / total * 100 if total else 0
@@ -1167,6 +1200,10 @@ def main():
         if done >= total:
             sys.stdout.write("\n")
 
+    # Only now that the run passed validation -- a doomed run should not have
+    # unloaded whatever ComfyUI was holding.
+    _free_comfyui_memory()
+
     try:
         convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
                 variant=args.variant, rank_alloc=args.rank_alloc, act_stats=args.act_stats,
@@ -1174,6 +1211,9 @@ def main():
                 seed=None if args.seed < 0 else args.seed)
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
+
+    elapsed = time.time() - t_start
+    print("\ntotal elapsed: {} ({:.0f}s)".format(_fmt_elapsed(elapsed), elapsed))
 
     hint = SAMPLER_HINTS.get(args.variant)
     if hint:
