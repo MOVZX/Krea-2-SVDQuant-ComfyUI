@@ -121,17 +121,20 @@ LAYER_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
 # Formats we know how to reconstruct back to BF16 from disk alone. FP8 storage is one
 # byte per element with no packing or pre-rotation, so `qdata * scale` recovers the
 # original tensor exactly as it was cast -- no architecture knowledge needed beyond
-# what's already in the file. INT8/W4A4 sources pack multiple values per byte and are
-# rotated (convrot) before quantization; unpacking those correctly needs the exact
-# in/out feature counts from the live nn.Linear, which isn't recoverable from the
-# checkpoint alone, so those are rejected instead.
-_DEQUANTIZABLE_FORMATS = ("float8_e4m3fn", "float8_e5m2")
+# what's already in the file. int8_tensorwise is also one byte per element, so its
+# qdata keeps the logical (out, in) shape and its convrot rotation is undone by the
+# same `dequantize_int8_convrot_weight` op the runtime matmul uses. W4A4 sources pack
+# two values per byte, and unpacking those correctly needs the exact in/out feature
+# counts from the live nn.Linear, which isn't recoverable from the checkpoint alone,
+# so those are rejected instead.
+_DEQUANTIZABLE_FORMATS = ("float8_e4m3fn", "float8_e5m2", "int8_tensorwise")
 
 
 def source_kind(path: str) -> str:
     """Classify a checkpoint by the dtype of its transformer-block weights.
 
-    'bf16' = BF16/FP16 only, 'fp8' = any FP8 target layer, 'other' = anything
+    'bf16' = BF16/FP16 only, 'fp8' = any FP8 target layer, 'int8' = any INT8
+    target layer, 'mixed' = both FP8 and INT8 target layers, 'other' = anything
     we cannot reconstruct (or no Krea 2 blocks at all). Header-only, so scanning
     a folder of 24 GB files stays cheap.
     """
@@ -141,15 +144,24 @@ def source_kind(path: str) -> str:
             header = json.loads(f.read(n))
         except (struct.error, json.JSONDecodeError, UnicodeDecodeError):
             return "other"
-    dtypes = {v["dtype"] for k, v in header.items()
-              if k.endswith(".weight")
-              and any(k[:-7].endswith(s) for s in _QUANT_SUFFIXES)}
+    keys = [k for k in header if k != "__metadata__" and k.endswith(".weight")]
+    try:
+        prefix = detect_prefix(keys)
+    except RuntimeError:
+        return "other"
+    # Anchored on the blocks container like `is_target`: txtfusion layers share the
+    # same leaf names (attn.wq, mlp.up, ...) and must not skew the classification.
+    dtypes = {header[k]["dtype"] for k in keys if is_target(k[:-len(".weight")], prefix)}
     if not dtypes:
         return "other"
     if dtypes <= {"BF16", "F16"}:
         return "bf16"
     if dtypes <= {"BF16", "F16", "F8_E4M3", "F8_E5M2"}:
         return "fp8"
+    if dtypes <= {"BF16", "F16", "I8"}:
+        return "int8"
+    if dtypes <= {"BF16", "F16", "F8_E4M3", "F8_E5M2", "I8"}:
+        return "mixed"
     return "other"
 
 
@@ -209,12 +221,19 @@ def _select_model() -> tuple[str, str]:
         candidates.append((full, kind))
 
     if not candidates:
-        raise SystemExit("No eligible models found (BF16/FP16 or FP8 source, not yet quantized).")
+        raise SystemExit("No eligible models found (BF16/FP16, FP8, INT8 or mixed source, not yet quantized).")
 
     print("Available models:")
     for i, (path, kind) in enumerate(candidates, 1):
         size_gb = os.path.getsize(path) / 1024 ** 3
-        tag = "  [FP8 source - use w4a8/svdq8]" if kind == "fp8" else ""
+        if kind == "fp8":
+            tag = "  [FP8 source - use w4a8/svdq8]"
+        elif kind == "int8":
+            tag = "  [INT8 source - expect quality loss]"
+        elif kind == "mixed":
+            tag = "  [mixed FP8/INT8 source - expect quality loss]"
+        else:
+            tag = ""
         print("  {}. {} ({:.1f} GB){}".format(i, os.path.basename(path), size_gb, tag))
     print("  0. Exit")
 
@@ -244,6 +263,10 @@ def _select_format(source_kind: str) -> str:
     print("  1. svdq8  W4A8 + low-rank branch (default)")
     if source_kind == "fp8":
         print("  2. svdq   W4A4 + low-rank branch (fastest, worst on FP8 sources)")
+    elif source_kind == "int8":
+        print("  2. svdq   W4A4 + low-rank branch (fastest, worst on INT8 sources)")
+    elif source_kind == "mixed":
+        print("  2. svdq   W4A4 + low-rank branch (fastest, worst on quantized sources)")
     else:
         print("  2. svdq   W4A4 + low-rank branch (fastest)")
     while True:
@@ -295,12 +318,12 @@ def detect_prefix(keys, default: str | None = None) -> str:
 def check_requantizable(handle, keys, prefix: str) -> None:
     """Make sure every target layer that's already quantized is something we can
     dequantize back to BF16 (see `_DEQUANTIZABLE_FORMATS`). Anything else -- most
-    importantly INT8/W4A4 -- needs the original BF16 (or FP16) release instead.
+    importantly W4A4 -- needs the original BF16 (or FP16) release instead.
     """
     def reject(layer, fmt):
         raise RuntimeError(
-            "Layer {} is already quantized as '{}'. Only FP8-quantized layers can be "
-            "automatically reconstructed and re-quantized; for INT8/W4A4 sources, use "
+            "Layer {} is already quantized as '{}'. Only FP8 and INT8-quantized layers "
+            "can be automatically reconstructed and re-quantized; for W4A4 sources, use "
             "the original BF16 (or FP16) release of the model instead.".format(layer, fmt)
         )
 
@@ -322,15 +345,51 @@ def check_requantizable(handle, keys, prefix: str) -> None:
                 reject(layer, conf.get("format"))
 
 
+def int8_layer_conf(handle, layer: str) -> dict:
+    """The format config for an INT8 target layer: its `comfy_quant` marker, or the
+    per-layer entry in `__metadata__._quantization_metadata` for marker-less files.
+    """
+    conf_key = "{}.comfy_quant".format(layer)
+    if conf_key in handle.keys():
+        conf = json.loads(bytes(handle.get_tensor(conf_key).tolist()))
+    else:
+        qmeta = (handle.metadata() or {}).get("_quantization_metadata")
+        bare = layer
+        for p in LAYER_PREFIXES:
+            if p and bare.startswith(p):
+                bare = bare[len(p):]
+                break
+        conf = json.loads(qmeta).get("layers", {}).get(bare) if qmeta else None
+    if not isinstance(conf, dict) or conf.get("format") != "int8_tensorwise":
+        raise RuntimeError(
+            "Layer {} is stored as INT8 but its metadata says '{}'; only "
+            "int8_tensorwise sources can be dequantized.".format(layer, conf.get("format") if isinstance(conf, dict) else "nothing"))
+    return conf
+
+
 def dequantize_target_weight(handle, layer: str, device: str) -> torch.Tensor:
-    """Load a target layer's weight as BF16, dequantizing it first if it's FP8.
+    """Load a target layer's weight as BF16, dequantizing it first if it's FP8 or INT8.
 
     Scaled FP8 (a `weight_scale` sits next to the weight, marked either by a
     `comfy_quant` key or by `__metadata__._quantization_metadata`): ``qdata.float() * scale``.
     Unscaled FP8 (a bare ``.to(float8_e4m3fn)`` cast, no scale): ``qdata`` as-is.
+    INT8 (``int8_tensorwise``, optionally convrot-rotated): the same dequantize op the
+    runtime matmul uses, with the convrot config from the layer's ``comfy_quant`` marker.
     Anything else is already ruled out by `check_requantizable`.
     """
     weight = handle.get_tensor("{}.weight".format(layer)).to(device=device)
+    if weight.dtype == torch.int8:
+        conf = int8_layer_conf(handle, layer)
+        layout_cls = get_layout_class(QUANT_ALGOS["int8_tensorwise"]["comfy_tensor_layout"])
+        params = layout_cls.Params(
+            scale=handle.get_tensor("{}.weight_scale".format(layer)).to(device=device),
+            orig_dtype=torch.bfloat16,
+            orig_shape=tuple(weight.shape),
+            is_weight=True,
+            convrot=conf.get("convrot", False),
+            convrot_groupsize=conf.get("convrot_groupsize", 256),
+        )
+        return layout_cls.dequantize(weight, params)
     scale_key = "{}.weight_scale".format(layer)
     if scale_key in handle.keys():
         scale = handle.get_tensor(scale_key).to(device=device).float()
