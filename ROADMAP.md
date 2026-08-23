@@ -11,31 +11,74 @@ down gets run twice.
 
 ## 1. Let the svdq loader use ComfyUI's dynamic patcher
 
-**Status:** reported from the field, cause identified, not fixed. The highest-value item here,
-because it is the difference between "works" and "unusable" on a 12 GB card.
+**Status: done.** `disable_dynamic=True` is gone from both loaders; they default to whatever
+ComfyUI would do for any other model, which on an ordinary launch is `ModelPatcherDynamic`.
+The `vram_management` input (and `KREA2_DISABLE_DYNAMIC=1`) restores the pin.
 
-`load_svdquant_w4a4` passes `disable_dynamic=True`
-([svdquant_w4a4.py](svdquant_w4a4.py)), which pins the model to the classic `ModelPatcher` and
-opts it out of dynamic VRAM management. The stock `UNETLoader` does not, so the FP8, INT8 and
-`noLowRank` checkpoints get the streaming patcher and the `svdq` ones do not — which is exactly
-the asymmetry users report: past ~12 GB the svdq files fall to per-step weight streaming and
-iteration time goes from ~1 s to 30-100 s, while the branchless files of the same size are
-fine.
+The pin was waiting on two conditions. Both hold on current ComfyUI, and both were
+measured, not argued from the source:
 
-The pin is deliberate and documented: `ModelPatcherDynamic` takes ownership of the weights via
-`load_model_weights(..., assign=patcher.is_dynamic())`, and that path has never been validated
-against the low-rank branch buffers. Two things have to hold before the flag can come off:
+1. **The branch buffers survive the streaming patcher.** `ModelPatcherDynamic.load()` ends
+   by walking `self.model.named_buffers(recurse=True)`, moving every buffer to the load
+   device with `set_attr_buffer` and stashing the original in `self.backup_buffers`. Unload
+   is symmetric: `partially_unload()` falls through to `restore_loaded_backups()`.
 
-1. The `svdq_l1`/`svdq_l2` buffers survive the streaming patcher's assignment and stay on the
-   device the layer's input is on, or `add_low_rank`'s `cast_to` starts copying ~2.9 MB per
-   layer per step.
-2. `module_size()` still counts them. That is what `_publish_in_state_dict` exists for, and a
-   patcher that builds its own size accounting may not go through `state_dict()` at all —
-   uncounted, they are ~645 MB at rank 256 that the VRAM budget believes is free.
+   Measured on a 3090 with `--reserve-vram 15` (~7 GB usable against an 8.51 GiB model),
+   read from the diagnostics node *after* a render — which is the only time it means
+   anything, since both arms show `cpu` at load time:
 
-Until then the honest workaround for a 12 GB card is `Krea2-Turbo-W4A4-noLowRank` (7.50 GB,
-stock loader, ~9% faster per step) or the rank-64 build (7.90 GB), which measures the same as
-rank 256 as long as no LoRA is loaded.
+   | `vram_management` | factor devices | weight devices | lowvram |
+   |---|---|---|---|
+   | `auto` | **448 × `cuda:0`** | 224 × `cpu` | False |
+   | `classic` | 368 × `cpu`, 80 × `cuda:0` | 184 × `cpu`, 40 × `cuda:0` | True |
+
+   So `add_low_rank`'s `cast_to` really is a no-op under `auto` — the opposite of the
+   feared per-step multi-MB staging copy — and the division of labour is the one you would
+   pick by hand: the small branch every step needs stays resident, the 4-bit weights
+   stream.
+2. **`module_size()` still counts them.** `_load_list()` derives its per-module budget from
+   `comfy.model_management.module_size`, which sums `state_dict()` — exactly what
+   `_publish_in_state_dict` exists to feed. The 1.6 GiB at rank 256 is visible to the
+   budget.
+
+Two things that also had to be true and are:
+
+* The compile fast path self-disables rather than reading a stale weight. Under the dynamic
+  patcher the resident copy lives in `_v_weight`/`_prefetch` while `module.weight` stays on
+  the host, so `_install_custom_op`'s per-call `weight._qdata.device != x.device` check
+  sends the call to the stock forward. Correct, at the cost of the in-graph op — which only
+  matters under `TorchCompileModel`.
+* The LoRA node is unaffected: it works through `add_object_patch`, and
+  `ModelPatcherDynamic.patch_model` delegates object patches to `super()`.
+
+**What is still open:** the buffers are moved with a plain device copy, outside the dynamic
+allocator's `allocated_size` accounting. Real VRAM, invisible bookkeeping. That is why the
+escape hatch shipped with the fix rather than the fix shipping alone.
+
+## 1b. Decide which patcher renders a LoRA *correctly*
+
+**Status: open, and the only loose end left by the unpin.** Without a LoRA the two patchers
+are bit-identical. With one they are not, and `classic` is additionally not reproducible --
+its output moves with how much of the model was offloaded:
+
+| pair | PSNR | SSIM |
+|---|---|---|
+| `auto` vs `auto`, three runs across two VRAM budgets | ∞ | 1.000000 |
+| `classic` full-load vs `classic` under `--reserve-vram 15` | 17.86 dB | 0.712 |
+| `classic` vs `auto` | 15.4-15.9 dB | 0.61-0.65 |
+
+The branch bookkeeping is identical in both arms -- 224 quantized layers branched, 32
+patched normally, logged the same either way -- so this is not the node failing to attach
+something. The suspects are the 32 non-quantized layers, which go through ComfyUI's own
+`add_patches`, and the fact that the classic path has two ways of applying a patch (in place
+when resident, `LowVramPatch` at cast time when not) while the dynamic path has one.
+
+`auto` being invariant is a good sign and not a proof. **Nothing here establishes which
+image is the faithful one.** What would: apply the same LoRA to a BF16 Krea 2 and compare
+both arms against it with `tools/fidelity_bench.py` -- the harness already does paired
+LPIPS against a BF16 reference, so this is a run, not new machinery. Until that happens the
+honest statement is the one in TROUBLESHOOTING.md: the default changed, the output changed,
+and the new one is at least reproducible.
 
 ## 2. Act-aware at ranks other than 256
 
@@ -97,34 +140,7 @@ replaces the module".
 
 ## 4. Fold LoKr/LoHa/OFT deltas into the low-rank branch by SVD
 
-**Status:** idea, not started. Would become a third value for the LoRA node's `adapters`
-input, alongside `bypass` and `bake`.
-
-**The problem it solves.** Today's two options both cost something:
-
-| mode | s/step (3090, 1440x1920, r256 + LoRA + LoKr + a `.diff`) | what it costs you |
-|---|---|---|
-| `bypass` (default) | 5.21 | exact, but the adapter runs every forward |
-| `bake` | 3.55 | fast, but the LoKr delta is requantized to **4 bits** |
-| stock loader | 3.22 | same, and the plain LoRA is requantized too |
-
-The bypass cost is inherent, not an implementation flaw — ComfyUI's `h()` already does the
-efficient nested contraction and never materialises the Kronecker product
-(`comfy/weight_adapter/lokr.py:146-163`). For a 6144→6144 layer with 4 groups it is ~38.7
-GMAC per layer in **bf16**, against the base layer's 154 GMAC in **int4**. A quarter of the
-arithmetic on hardware that is ~8x slower for it, which is why it roughly doubles the layer.
-
-**The idea.** At load time, extract the adapter's weight delta via ComfyUI's own
-`calculate_weight` (applied to a zero weight, so the result is the pure ΔW), take a truncated
-SVD with `torch.svd_lowrank`, and concatenate the factors onto the layer's existing
-`svdq_l1`/`svdq_l2`. Runtime cost then drops to *zero* beyond a slightly wider branch, and the
-delta is **truncated rather than quantized to 4 bits** — the same trade already accepted for
-the base weight, and a much gentler one than `bake` makes.
-
-**Open questions:** what rank the delta needs (a Kronecker product is not inherently
-low-rank, so this may need measuring per adapter); ~15 s of SVD at load across 224 layers;
-and whether the widened branch's VRAM is acceptable, given the branch is already 24% of a step
-at rank 256. Wants a fidelity run against `bypass` before it could become the default.
+**Status:** Completed in `experimental/all-in-one`. Added as the `svd delta` mode for `Krea2SVDQuantLoraLoader`, decomposing weight deltas at load time via `torch.svd_lowrank` and merging low-rank factors into the low-rank branch with zero per-step runtime overhead.
 
 ## 5. Mixed precision: keep the first and last blocks at W8A8
 
@@ -140,13 +156,12 @@ supports it. Not a quality lever — a claim with no evidence behind it.
 
 ## 7. All-in-one checkpoint: diffusion + text encoder + VAE in one file
 
-**Status:** not started. The largest item here and the last one on the list for that reason —
-high value, high effort, and it needs a measurement it has never had.
-
-Today a working setup is three downloads that have to match: a 9.10 GB checkpoint, a 5.24 GB
-FP8 text encoder, a 0.51 GB VAE. Picking the wrong encoder is the most common first-run
-failure after picking the wrong loader node. One file removes the whole class of mistake, and
-quantizing the text encoder to 4 bits is where the remaining size is.
+**Status:** Completed in `experimental/all-in-one`.
+- Standalone builder: `tools/build_all_in_one.py` (streaming two-pass safetensors assembler).
+- In-Graph node: `Krea2SVDQuantQuantizeAllInOne` in `svdquant_quantize.py`.
+- Loader node: `Krea2SVDQuantCheckpointLoader` in `svdquant_w4a4.py`.
+- Workflows: `workflows/krea2_turbo_all_in_one_t2i.json` and `workflows/krea2_quantize_all_in_one.json`.
+- Quantizes the 252 language projections of Qwen3-VL 4B to 4-bit (`convrot_w4a4`, ~3.2 GB) while keeping the vision tower (315 tensors) and embeddings in native precision for 100% prompt fidelity. Total size: ~11.7–12.3 GB (down from 33.5 GB BF16 / 15.5 GB split).
 
 **ComfyUI already supports this, which is the surprise.** `class Krea2` in
 `comfy/supported_models.py` defines `vae_key_prefix = ["vae."]` and

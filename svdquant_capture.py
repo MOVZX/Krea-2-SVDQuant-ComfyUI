@@ -30,7 +30,7 @@ import torch
 
 import folder_paths
 
-from .quantize_krea2 import _QUANT_SUFFIXES
+from .quantize_krea2 import ALL_QUANT_SUFFIXES as _QUANT_SUFFIXES
 from .svdquant_diag import _CATEGORY
 
 # layer name -> {"sumsq": float64 [in_features] on cpu, "count": int}
@@ -78,6 +78,10 @@ def is_target(name: str) -> bool:
     Deliberately *not* keyed on the weight being quantized: the statistics are supposed to
     come from the BF16 model, where no weight is a QuantizedTensor yet.
     """
+    # The union across every architecture in `quantize_krea2.ARCHITECTURES`, not one
+    # model's set: this matches against a live module tree, so a leaf name no loaded model
+    # has simply never appears. Matching the union is what lets one pair of capture nodes
+    # serve every architecture the quantizer knows, without being told which is loaded.
     return name.startswith("blocks.") and name.endswith(_QUANT_SUFFIXES)
 
 
@@ -260,7 +264,21 @@ class Krea2SVDQuantCaptureSave:
             filename = _SOURCE_MODEL_STEM + "_act_stats.safetensors"
         elif not filename.strip():
             filename = "krea2_act_stats.safetensors"
-        path = os.path.join(folder_paths.get_output_directory(), "svdq_act_stats", filename)
+        # `os.path.join` alone does not keep the subdirectory promise: hand it an absolute
+        # path and it discards the first argument, and `write()` then happily creates
+        # whatever directory it names. The sibling Quantize node resolves `act_stats`
+        # against this same folder, so validate the name before use.
+        if os.path.isabs(filename) or os.path.splitdrive(filename)[0]:
+            raise ValueError(
+                "filename must be relative to ComfyUI/output/svdq_act_stats/, "
+                "got an absolute path: {}".format(filename))
+        out_dir = os.path.join(folder_paths.get_output_directory(), "svdq_act_stats")
+        path = os.path.normpath(os.path.join(out_dir, filename))
+        if os.path.commonpath([os.path.abspath(out_dir), os.path.abspath(path)]) != \
+                os.path.abspath(out_dir):
+            raise ValueError(
+                "filename must stay under ComfyUI/output/svdq_act_stats/, got: {}"
+                .format(filename))
         info = write(path)
         if not keep_capturing:
             detach()
