@@ -247,7 +247,7 @@ def _select_format(source_kind: str) -> str:
     else:
         print("  2. svdq   W4A4 + low-rank branch (fastest)")
     while True:
-        choice = input("Select format [1]: ").strip() or "1"
+        choice = input("Select format [2]: ").strip() or "2"
         if choice in ("1", "svdq8"):
             return "svdq8"
         if choice in ("2", "svdq"):
@@ -1046,8 +1046,8 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
     # a plain one, so without a tag the two are indistinguishable on disk.
     act_tag = "-actaware" if act_stats else ""
     if rank:
-        base_tag = "W4A4" if _FORMAT_ALIASES[fmt_name] == "convrot_w4a4" else "W4A8"
-        suffix = "SVDQuant-{}-rank{}{}{}".format(base_tag, rank, alloc_tag, act_tag)
+        base_tag = "SVDQ" if _FORMAT_ALIASES[fmt_name] == "convrot_w4a4" else "SVDQ8"
+        suffix = "{}-r{}{}{}".format(base_tag, rank, alloc_tag, act_tag)
     elif fmt_name != "fp8":
         suffix = "{}-convrot".format(fmt_name.upper())
     else:
@@ -1077,9 +1077,9 @@ def main():
     ap.add_argument("src", nargs="?", default=None,
                     help="Source model path (omit to select interactively)")
     ap.add_argument("--format", choices=["int8", "w4a4", "w4a8", "svdq", "svdq8", "fp8"],
-                    default="svdq8",
-                    help="svdq8 (default) = w4a8 residual + SVDQuant low-rank bf16 branch; "
-                         "svdq = the same on a w4a4 base (fastest, least faithful); "
+                    default="svdq",
+                    help="svdq (default) = w4a4 residual + SVDQuant low-rank bf16 branch "
+                         "(fastest, least faithful); svdq8 = the same on a w4a8 residual; "
                          "w4a8/w4a4 = no branch; "
                          "fp8 = float8_e4m3fn, no convrot, no low-rank branch")
     ap.add_argument("--no-low-rank", action="store_true",
@@ -1088,7 +1088,7 @@ def main():
                          "measured quality loss is mostly visible when a LoRA is on top. "
                          "The other formats have no branch and are unaffected")
     ap.add_argument("--groupsize", type=int, default=256, help="unused for fp8")
-    ap.add_argument("--rank", type=int, default=256, help="low-rank branch budget, svdq only")
+    ap.add_argument("--rank", type=int, default=256, help="low-rank branch budget, svdq/svdq8 only")
     ap.add_argument("--rank-alloc", choices=sorted(RANK_ALLOCATIONS), default="uniform",
                     help="how to spread the rank budget across the eight projection types. "
                          "uniform = same rank everywhere. gqa = byte-neutral reallocation "
