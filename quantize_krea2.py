@@ -1106,6 +1106,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     if progress_cb is not None:
         progress_cb(quantized, expected_layers, "writing {:.2f} GB ...".format(
             sum(t.numel() * t.element_size() for t in out.values()) / 1024 ** 3))
+    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
     save_file(out, dst, metadata=metadata)
     size = os.path.getsize(dst) / 1024 ** 3
     rank_desc = ""
