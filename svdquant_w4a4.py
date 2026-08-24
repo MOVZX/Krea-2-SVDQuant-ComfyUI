@@ -792,7 +792,10 @@ class Krea2SVDQuantW4A4Loader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_name": ([f for f in folder_paths.get_filename_list("diffusion_models")
+                # Bare filenames keep the dropdown readable; `load` maps them back onto the
+                # fixed Krea-2/SVDQuant/ folder (workflows saved before this change still
+                # carry the full relative path and resolve through the same branch).
+                "model_name": ([os.path.basename(f) for f in folder_paths.get_filename_list("diffusion_models")
                                 if f.startswith("Krea-2/SVDQuant/")], {
                     "tooltip": "A checkpoint from quantize_krea2.py --format svdq or svdq8 "
                                "(it carries *.svdq_l1/*.svdq_l2 tensors). The --format "
@@ -824,7 +827,23 @@ class Krea2SVDQuantW4A4Loader:
                    "checkpoint. Self-contained: no separate base model needed. The status "
                    "output tells you whether the fast tensor-core kernel is in play.")
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, model_name):
+        # The dropdown lists bare filenames, but workflows saved before that switch still
+        # carry the full relative path. `load` resolves both to the same file, so both
+        # forms must pass here -- the default combo membership check would reject the
+        # legacy values and refuse the whole prompt.
+        if "/" not in model_name:
+            model_name = "Krea-2/SVDQuant/" + model_name
+        try:
+            folder_paths.get_full_path_or_raise("diffusion_models", model_name)
+        except Exception as exc:
+            return str(exc)
+        return True
+
     def load(self, model_name, vram_management="auto"):
+        if "/" not in model_name:
+            model_name = "Krea-2/SVDQuant/" + model_name
         path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
         patcher = load_svdquant_w4a4(path, vram_management=vram_management)
         status = getattr(patcher, "krea2_load_summary", "")

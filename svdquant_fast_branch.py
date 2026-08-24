@@ -149,9 +149,12 @@ def _triton_usable(a: torch.Tensor, b: torch.Tensor) -> bool:
             pa = torch.zeros(pm, K, device=a.device, dtype=a.dtype)
             pc = torch.zeros(pm, N, device=a.device, dtype=a.dtype)
             _launch(pa, b, pc, pc)
-        except Exception as exc:
-            fits = "OutOfResources" in type(exc).__name__ or \
-                "shared memory" in str(exc)
+        except Exception:
+            # The probe is the verdict, not the formula: a launch that dies here --
+            # OutOfResources in particular -- is the tile not fitting, whatever the
+            # formula claimed. Anything else (a triton compile hiccup) is no reason
+            # to risk the prompt, so it declines too.
+            fits = False
     _TFITS[key] = fits
     return fits
 

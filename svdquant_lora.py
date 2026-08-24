@@ -145,27 +145,27 @@ def _svd_adapter_factors(adapter, strength: float, device, dtype, max_rank: int 
     """
     try:
         delta = None
-        # Case 1: ComfyUI WeightAdapterBase with calculate_weight
-        if hasattr(adapter, "calculate_weight"):
-            shape = getattr(adapter, "shape", None)
-            if shape is not None and len(shape) == 2:
-                zeros = torch.zeros(shape, dtype=torch.float32, device="cpu")
-                delta = adapter.calculate_weight(zeros)
-        # Case 2: Tuple / Diff / weights directly
-        if delta is None and hasattr(adapter, "weights"):
+        if hasattr(adapter, "weights"):
             weights = adapter.weights
-            if weights and isinstance(adapter, comfy.weight_adapter.DiffAdapter):
-                delta = weights[0]
-            elif isinstance(adapter, comfy.weight_adapter.LoKrAdapter) and len(weights) >= 2:
+            if isinstance(adapter, comfy.weight_adapter.LoKrAdapter) and len(weights) >= 2:
                 w1, w2 = weights[0], weights[1]
                 if w1 is not None and w2 is not None:
+                    # ComfyUI's own LoKr delta for this (non-cp) case: kron(w1, w2),
+                    # alpha forced to 1.0 because `dim` is only set by the cp variant.
                     delta = torch.kron(w1.to(torch.float32), w2.to(torch.float32))
-            elif isinstance(adapter, comfy.weight_adapter.LoHaAdapter) and len(weights) >= 4:
-                w1a, w1b, w2a, w2b = weights[:4]
-                if all(w is not None for w in (w1a, w1b, w2a, w2b)):
-                    delta = (w1a.to(torch.float32) @ w1b.to(torch.float32)) * (w2a.to(torch.float32) @ w2b.to(torch.float32))
-        elif isinstance(adapter, tuple) and len(adapter) >= 1 and torch.is_tensor(adapter[0]):
-            delta = adapter[0]
+            elif isinstance(adapter, comfy.weight_adapter.LoHaAdapter) and len(weights) >= 5:
+                # The tuple is (w1a, w1b, alpha, w2a, w2b, hada_t1, hada_t2, dora_scale) --
+                # slot 2 is a float, which is why the factors cannot be read positionally
+                # from the first four slots. The cp variant (hada_t1/t2) builds the delta
+                # through 4D einsums this path does not reproduce, so it takes the bypass.
+                w1a, w1b, alpha, w2a, w2b = weights[:5]
+                if (w1a is not None and w1b is not None and w2a is not None
+                        and w2b is not None and weights[5] is None and weights[6] is None):
+                    m1 = w1a.to(torch.float32) @ w1b.to(torch.float32)
+                    m2 = w2a.to(torch.float32) @ w2b.to(torch.float32)
+                    if alpha is not None:
+                        m1 = m1 * (float(alpha) / w1b.shape[0])
+                    delta = m1 * m2
 
         if delta is None or delta.ndim != 2:
             return None
