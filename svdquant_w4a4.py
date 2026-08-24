@@ -730,6 +730,17 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
 
     _attach_svdq_branches(patcher, branches, layer_prefix, metadata, path, compile_safe,
                           arch=_detect_arch(branches, layer_prefix))
+
+    # `TorchCompileModel` (and multigpu deepclones) rebuild a classic patcher through this
+    # factory (model_patcher.clone), so it must re-run the whole loader. A stock
+    # file-based factory would come back branchless and sample the plain quantized model
+    # with no one the wiser. `disable_dynamic=True` is the clone asking for the classic
+    # patcher, which is exactly this loader's `classic` mode.
+    def _rebuild(*args, disable_dynamic=False, **kwargs):
+        mode = "classic" if disable_dynamic else vram_management
+        return load_svdquant_w4a4(path, model_options=model_options or {}, vram_management=mode)
+
+    patcher.cached_patcher_init = (_rebuild, ())
     return patcher
 
 
@@ -783,6 +794,17 @@ def load_svdquant_checkpoint(path: str, output_vae: bool = True, output_clip: bo
         logging.info("[krea2-svdquant] %s", summary)
         patcher.krea2_load_summary = "\n".join(x for x in (summary, dispatch) if x)
 
+    # Same reload-factory registration as the W4A4 loader: without it, `TorchCompileModel`'s
+    # clone(disable_dynamic=True) cannot rebuild this patcher and refuses to compile it.
+    # The factory returns the model patcher only -- that is what model_patcher.clone
+    # consumes from the factory's result.
+    def _rebuild(*args, disable_dynamic=False, **kwargs):
+        mode = "classic" if disable_dynamic else vram_management
+        return load_svdquant_checkpoint(path, model_options=model_options,
+                                        te_model_options=te_model_options,
+                                        vram_management=mode)[0]
+
+    patcher.cached_patcher_init = (_rebuild, ())
     status = getattr(patcher, "krea2_load_summary", "")
     return patcher, clip, vae, status
 
