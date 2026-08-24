@@ -162,8 +162,9 @@ quantizes Krea 2 into formats ComfyUI already ships native kernels for (`int8_te
 top of the native W4A4 kernel to claw back accuracy at 4 bits.
 
 No calibration dataset is required: the `convrot` group-wise Hadamard rotation spreads
-outliers analytically, and the kernel quantizes activations at run time. `--act-stats` can use
-a calibration pass if you have one, but the default path needs nothing.
+outliers analytically, and the kernel quantizes activations at run time. The `svdq` / `svdq8`
+builds additionally take an activation-statistics file (`--act-stats`, auto-detected in
+`ComfyUI/output/svdq_act_stats/`); the other formats need nothing.
 
 ## The nodes
 

@@ -3,7 +3,7 @@
 ComfyUI already ships native kernels for these formats via comfy_kitchen, so the output
 loads with a plain ``UNETLoader`` -- no custom node, and ordinary LoRA loaders work.
 
-Five targets:
+Six targets:
 
 * ``int8``  -> ``int8_tensorwise`` with per-channel scales + convrot (W8A8).
                Natively accelerated on Ampere INT8 tensor cores.
@@ -1250,12 +1250,12 @@ def main():
                          "towards the GQA kv projections, which absorb ~2x the error at a "
                          "third of the branch cost (see RANK_ALLOCATIONS)")
     ap.add_argument("--refine-iters", type=int, default=100,
-                    help="svdq only: refine the low-rank branch against the quantization "
+                    help="svdq/svdq8 only: refine the low-rank branch against the quantization "
                          "error, keeping the best (0 = plain single-shot SVD, much faster "
                          "but ~10%% more reconstruction error). This is a cap; --refine-tol "
                          "is what usually stops the loop first")
     ap.add_argument("--refine-tol", type=float, default=REFINE_TOL, metavar="FRACTION",
-                    help="svdq only: stop refining a layer once an iteration improves its "
+                    help="svdq/svdq8 only: stop refining a layer once an iteration improves its "
                          "reconstruction error by less than this fraction (default %(default)s "
                          "= 0.1%%). Lower means more iterations for less return: 0.001 takes "
                          "~22 iterations per layer, 0.005 takes ~9 for 2%% more error, and 0 "
@@ -1265,7 +1265,7 @@ def main():
                          "and the recorded metadata -- quantization is identical for both, "
                          "the difference is the sampler settings you run afterwards")
     ap.add_argument("--act-stats", default=None, metavar="PATH",
-                    help="svdq only: activation statistics from the Krea2 SVDQuant Capture "
+                    help="svdq/svdq8 only: activation statistics from the Krea2 SVDQuant Capture "
                          "nodes. Weights the low-rank split by per-input-channel activation "
                          "RMS, so the branch spends its capacity on the directions the model "
                          "actually drives instead of on the largest weights. Costs nothing "
@@ -1297,12 +1297,14 @@ def main():
         args.format = plain or args.format
 
     if args.act_stats:
-        if args.format not in ("svdq", "svdq8"):
+        if args.format not in _BRANCHED_FORMATS:
             raise SystemExit("--act-stats only applies to the svdq formats: it weights the "
                              "low-rank split, and the other formats have no branch")
         if not os.path.exists(args.act_stats):
             raise SystemExit("--act-stats file not found: {}".format(args.act_stats))
-    else:
+    elif args.format in _BRANCHED_FORMATS:
+        # The branch needs statistics; the branchless formats do not, and requiring a file
+        # they never read would turn `--format fp8` into a dead end.
         # Auto-detect: {source_name}_act_stats.safetensors di ComfyUI/output/svdq_act_stats/
         derived = os.path.splitext(os.path.basename(args.src))[0] + "_act_stats.safetensors"
         comfy_root = _find_comfyui_root()
@@ -1310,14 +1312,13 @@ def main():
             candidate = os.path.join(comfy_root, "output", "svdq_act_stats", derived)
             if os.path.isfile(candidate):
                 args.act_stats = candidate
-
-    if not args.act_stats:
-        stem = os.path.splitext(os.path.basename(args.src))[0]
-        expected = os.path.join("svdq_act_stats", stem + "_act_stats.safetensors")
-        raise SystemExit(
-            f"act_stats file not found under ComfyUI/output/{expected}\n"
-            f"Run the Krea2 SVDQuant Capture nodes first to generate it."
-        )
+        if not args.act_stats:
+            stem = os.path.splitext(os.path.basename(args.src))[0]
+            expected = os.path.join("svdq_act_stats", stem + "_act_stats.safetensors")
+            raise SystemExit(
+                f"act_stats file not found under ComfyUI/output/{expected}\n"
+                f"Run the Krea2 SVDQuant Capture nodes first to generate it."
+            )
 
     # RuntimeError is the shared failure type (see `convert`); the CLI wants SystemExit so it
     # prints one clean line instead of a traceback.

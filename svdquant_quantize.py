@@ -47,6 +47,18 @@ def _free_bytes(path: str) -> int:
     return shutil.disk_usage(os.path.dirname(os.path.abspath(path))).free
 
 
+def _outside(dst: str, base_dir: str) -> bool:
+    """True if `dst` resolves outside `base_dir`.
+
+    `output_name` is a free-text STRING input that lands in a path, and a workflow JSON
+    is a file someone else can write -- the same reason Capture Save validates its
+    filename. A name of `../../x` would otherwise write a .safetensors anywhere the
+    ComfyUI process can reach.
+    """
+    base = os.path.abspath(base_dir)
+    return os.path.commonpath([base, os.path.abspath(dst)]) != base
+
+
 class Krea2SVDQuantQuantize:
     @classmethod
     def INPUT_TYPES(cls):
@@ -168,7 +180,9 @@ class Krea2SVDQuantQuantize:
             name = output_name.strip()
             if not name.endswith(".safetensors"):
                 name += ".safetensors"
-            dst = os.path.join(os.path.dirname(src), name)
+            # The same "SVDQuant" subdir `run` writes to: validating a different path would
+            # flag a collision that cannot happen and miss the one that can.
+            dst = os.path.join(os.path.dirname(src), "SVDQuant", name)
         else:
             # An act-aware build lands on a different filename, and act_stats is unknowable
             # here. Pass None and the check is against the un-tagged name: it can miss a
@@ -176,6 +190,11 @@ class Krea2SVDQuantQuantize:
             # be wrong.
             dst, _note = derive_out_path(src, format, rank, variant, rank_alloc, None)
 
+        # Anchored on the source's own folder (not the first registered one, which can be an
+        # alias like models/unet): every output of this node belongs next to its source.
+        if _outside(dst, os.path.dirname(src)):
+            return ("output_name must stay inside the folder holding the source model, got: {}"
+                    .format(output_name))
         if os.path.exists(dst) and not overwrite:
             return ("{} already exists. Enable 'overwrite', or set a different output_name."
                     .format(dst))
@@ -243,6 +262,9 @@ class Krea2SVDQuantQuantize:
             if note:
                 logging.info("[krea2-svdquant] %s", note)
 
+        if _outside(dst, os.path.dirname(src)):
+            raise RuntimeError("output_name must stay inside the folder holding the source "
+                               "model, got: {}".format(output_name))
         if os.path.exists(dst) and not overwrite:
             raise RuntimeError(
                 "{} already exists. Enable 'overwrite', or set a different output_name."
@@ -388,6 +410,9 @@ class Krea2SVDQuantQuantizeAllInOne:
             return str(exc)
 
         dst = cls._out_path(output_name, variant, format, rank, te_format)
+        if _outside(dst, folder_paths.get_folder_paths("checkpoints")[0]):
+            return ("output_name must stay inside the checkpoints folder, got: {}"
+                    .format(output_name))
         if os.path.exists(dst) and not overwrite:
             return ("{} already exists. Enable 'overwrite', or set a different output_name."
                     .format(dst))
@@ -432,6 +457,10 @@ class Krea2SVDQuantQuantizeAllInOne:
         os.makedirs(folder_paths.get_folder_paths("checkpoints")[0], exist_ok=True)
         dst = self._out_path(output_name, variant, format, rank, te_format)
 
+        if _outside(dst, folder_paths.get_folder_paths("checkpoints")[0]):
+            raise RuntimeError("output_name must stay inside the checkpoints folder, "
+                               "got: {}".format(output_name))
+
         if os.path.exists(dst) and not overwrite:
             raise RuntimeError(
                 "{} already exists. Enable 'overwrite', or set a different output_name."
@@ -454,9 +483,25 @@ class Krea2SVDQuantQuantizeAllInOne:
         temp_dit = None
 
         if not already_quantized:
-            stats_path = act_stats.strip() or None
-            if stats_path is not None and not os.path.isabs(stats_path):
-                stats_path = os.path.join(folder_paths.get_output_directory(), stats_path)
+            # The same resolution the Quantize node uses, so the two nodes cannot drift:
+            # a bare filename lives in ComfyUI/output/svdq_act_stats/, and an empty input
+            # auto-detects from the DiT's stem rather than silently building plain.
+            stats_path = act_stats.strip()
+            if not stats_path:
+                derived = os.path.splitext(os.path.basename(dit_src))[0] + "_act_stats.safetensors"
+                derived_full = os.path.join(folder_paths.get_output_directory(),
+                                            "svdq_act_stats", derived)
+                stats_path = derived_full if os.path.isfile(derived_full) else None
+            if stats_path is not None:
+                if format != "svdq":
+                    raise RuntimeError("act_stats only applies to the svdq format: it weights "
+                                       "the low-rank branch, and the other formats have no "
+                                       "branch.")
+                if not os.path.isabs(stats_path):
+                    stats_path = os.path.join(folder_paths.get_output_directory(),
+                                              "svdq_act_stats", stats_path)
+                if not os.path.isfile(stats_path):
+                    raise RuntimeError("act_stats file not found: {}".format(stats_path))
             # ComfyUI's temp directory rather than models/checkpoints/: a run killed
             # mid-quantize leaves this ~8 GB file behind -- the `finally` below only covers
             # a clean unwind -- and beside the real checkpoints it shows up in every loader

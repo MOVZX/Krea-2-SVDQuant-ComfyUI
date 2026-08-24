@@ -55,7 +55,14 @@ def main():
                          "allocates nothing, never touches the GPU")
     args = ap.parse_args()
 
-    fmt, rank = resolve_format(args.format, args.rank, rank_was_set=True)
+    # `rank` has a default of 64, so "was it set?" comes from argparse the same way the
+    # main CLI does it: without this, `--format w4a4` without `--rank` died on "rank only
+    # applies to the svdq formats" even though the user never asked for a rank.
+    try:
+        fmt, rank = resolve_format(args.format, args.rank,
+                                   rank_was_set=args.rank != ap.get_default("rank"))
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
 
     out = args.out
     if out is None:
