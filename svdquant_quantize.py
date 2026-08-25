@@ -26,6 +26,7 @@ import folder_paths
 from .quantize_krea2 import (
     SAMPLER_HINTS,
     convert,
+    default_out_dir,
     derive_out_path,
     resolve_format,
 )
@@ -176,13 +177,14 @@ class Krea2SVDQuantQuantize:
         except Exception as exc:
             return str(exc)
 
+        out_dir = default_out_dir(src, rank > 0)
         if output_name.strip():
             name = output_name.strip()
             if not name.endswith(".safetensors"):
                 name += ".safetensors"
-            # The same "SVDQuant" subdir `run` writes to: validating a different path would
+            # The same output dir `run` writes to: validating a different path would
             # flag a collision that cannot happen and miss the one that can.
-            dst = os.path.join(os.path.dirname(src), "SVDQuant", name)
+            dst = os.path.join(out_dir, name)
         else:
             # An act-aware build lands on a different filename, and act_stats is unknowable
             # here. Pass None and the check is against the un-tagged name: it can miss a
@@ -190,11 +192,11 @@ class Krea2SVDQuantQuantize:
             # be wrong.
             dst, _note = derive_out_path(src, format, rank, variant, rank_alloc, None)
 
-        # Anchored on the source's own folder (not the first registered one, which can be an
-        # alias like models/unet): every output of this node belongs next to its source.
-        if _outside(dst, os.path.dirname(src)):
-            return ("output_name must stay inside the folder holding the source model, got: {}"
-                    .format(output_name))
+        # Anchored on the output folder itself: `output_name` is free text that lands in a
+        # path, and a workflow JSON is a file someone else can write.
+        if _outside(dst, out_dir):
+            return ("output_name must stay inside the output folder ({}), got: {}"
+                    .format(out_dir, output_name))
         if os.path.exists(dst) and not overwrite:
             return ("{} already exists. Enable 'overwrite', or set a different output_name."
                     .format(dst))
@@ -252,19 +254,20 @@ class Krea2SVDQuantQuantize:
             if not os.path.isfile(stats_path):
                 raise RuntimeError("act_stats file not found: {}".format(stats_path))
 
+        out_dir = default_out_dir(src, rank > 0)
         if output_name.strip():
             name = output_name.strip()
             if not name.endswith(".safetensors"):
                 name += ".safetensors"
-            dst = os.path.join(os.path.dirname(src), "SVDQuant", name)
+            dst = os.path.join(out_dir, name)
         else:
             dst, note = derive_out_path(src, format, rank, variant, rank_alloc, stats_path)
             if note:
                 logging.info("[krea2-svdquant] %s", note)
 
-        if _outside(dst, os.path.dirname(src)):
-            raise RuntimeError("output_name must stay inside the folder holding the source "
-                               "model, got: {}".format(output_name))
+        if _outside(dst, out_dir):
+            raise RuntimeError("output_name must stay inside the output folder ({}), got: {}"
+                               .format(out_dir, output_name))
         if os.path.exists(dst) and not overwrite:
             raise RuntimeError(
                 "{} already exists. Enable 'overwrite', or set a different output_name."

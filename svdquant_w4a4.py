@@ -25,7 +25,8 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 
-from .quantize_krea2 import detect_architecture, detect_prefix
+from .quantize_krea2 import (_has_svdq_branch, default_out_dir, detect_architecture,
+                             detect_prefix)
 from .sage_mask_guard import install_mask_guard
 from .svdquant_diag import (BUF_L1, BUF_L2, _CATEGORY, branch_factors,  # noqa: F401
                             log_dispatch, quantized_linears)
@@ -809,16 +810,48 @@ def load_svdquant_checkpoint(path: str, output_vae: bool = True, output_clip: bo
     return patcher, clip, vae, status
 
 
+def _svdquant_candidates() -> list[str]:
+    """Bare filenames of loadable SVDQuant checkpoints, from both home folders."""
+    names = {os.path.basename(f) for f in folder_paths.get_filename_list("diffusion_models")
+             if f.startswith("Krea-2/SVDQuant/")}
+    out_dir = default_out_dir()
+    if os.path.isdir(out_dir):
+        # output/diffusion_models/ also holds plain checkpoints (merges, w4a4/w4a8/int8/
+        # fp8 builds); only files with the low-rank branch are loadable here, so verify
+        # the branch keys instead of assuming.
+        for f in os.listdir(out_dir):
+            if f.endswith(".safetensors") and _has_svdq_branch(os.path.join(out_dir, f)):
+                names.add(f)
+    return sorted(names)
+
+
+def _resolve_model_name(model_name: str) -> str:
+    """A bare filename or a saved relative path -> the absolute file.
+
+    Bare names are looked up in Krea-2/SVDQuant/ first (workflows saved earlier must keep
+    hitting the same file), then in the default output folder.
+    """
+    if "/" in model_name:
+        return folder_paths.get_full_path_or_raise("diffusion_models", model_name)
+    try:
+        return folder_paths.get_full_path_or_raise("diffusion_models", "Krea-2/SVDQuant/" + model_name)
+    except Exception:
+        direct = os.path.join(default_out_dir(), model_name)
+        if os.path.isfile(direct):
+            return direct
+        raise
+
+
 class Krea2SVDQuantW4A4Loader:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # Bare filenames keep the dropdown readable; `load` maps them back onto the
-                # fixed Krea-2/SVDQuant/ folder (workflows saved before this change still
-                # carry the full relative path and resolve through the same branch).
-                "model_name": ([os.path.basename(f) for f in folder_paths.get_filename_list("diffusion_models")
-                                if f.startswith("Krea-2/SVDQuant/")], {
+                # Bare filenames keep the dropdown readable; `load` maps them back onto
+                # the folders _svdquant_candidates scanned (workflows saved before that
+                # switch still carry the full relative path and resolve through the
+                # same branch).
+                "model_name": (_svdquant_candidates(), {
                     "tooltip": "A checkpoint from quantize_krea2.py --format svdq or svdq8 "
                                "(it carries *.svdq_l1/*.svdq_l2 tensors). The --format "
                                "w4a4 / w4a8 / int8 / fp8 checkpoints have no branch and load "
@@ -855,18 +888,14 @@ class Krea2SVDQuantW4A4Loader:
         # carry the full relative path. `load` resolves both to the same file, so both
         # forms must pass here -- the default combo membership check would reject the
         # legacy values and refuse the whole prompt.
-        if "/" not in model_name:
-            model_name = "Krea-2/SVDQuant/" + model_name
         try:
-            folder_paths.get_full_path_or_raise("diffusion_models", model_name)
+            _resolve_model_name(model_name)
         except Exception as exc:
             return str(exc)
         return True
 
     def load(self, model_name, vram_management="auto"):
-        if "/" not in model_name:
-            model_name = "Krea-2/SVDQuant/" + model_name
-        path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
+        path = _resolve_model_name(model_name)
         patcher = load_svdquant_w4a4(path, vram_management=vram_management)
         status = getattr(patcher, "krea2_load_summary", "")
         return {"ui": {"text": [status]}, "result": (patcher, status)}

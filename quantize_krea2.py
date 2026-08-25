@@ -258,14 +258,17 @@ def _select_model() -> tuple[str, str]:
     if not os.path.isdir(models_dir):
         raise SystemExit("Krea-2 models directory not found: {}".format(models_dir))
 
-    svdquant_dir = os.path.join(models_dir, "SVDQuant")
+    # SVDQuant builds live in Krea-2/SVDQuant/; the other quantized formats land in
+    # output/diffusion_models/, which also holds non-quantized files (merges, ...), so
+    # only marker-verified stems count there.
     quantized_stems = set()
-    if os.path.isdir(svdquant_dir):
-        quantized_stems = {
-            os.path.splitext(n)[0]
-            for n in os.listdir(svdquant_dir)
-            if n.endswith(".safetensors")
-        }
+    for d, check_marker in ((os.path.join(models_dir, "SVDQuant"), False),
+                            (os.path.join(comfy_root, OUTPUT_SUBDIR), True)):
+        if not os.path.isdir(d):
+            continue
+        for n in os.listdir(d):
+            if n.endswith(".safetensors") and (not check_marker or _has_comfy_quant(os.path.join(d, n))):
+                quantized_stems.add(os.path.splitext(n)[0])
 
     candidates = []
     for f in sorted(os.listdir(models_dir)):
@@ -1185,6 +1188,42 @@ def resolve_format(fmt_name: str, rank: int, rank_was_set: bool = True) -> tuple
     return fmt, (rank if ranked else 0)
 
 
+# The folder the plain (branchless) quantized checkpoints land in by default: under
+# ComfyUI/output/ so derived files never sit on top of the source models.
+OUTPUT_SUBDIR = os.path.join("output", "diffusion_models")
+
+
+def default_out_dir(src: str = "", svdquant: bool = False) -> str:
+    """SVDQuant builds (svdq/svdq8) go to SVDQuant/ next to the source models -- for the
+    usual Krea-2/ sources that is models/diffusion_models/Krea-2/SVDQuant/ -- where the
+    loader's dropdown scans. The plain w4a4 / w4a8 / int8 / fp8 builds go to
+    <ComfyUI>/output/diffusion_models/. Without a ComfyUI root (CLI run away from an
+    install) everything falls back to SVDQuant/ next to the source."""
+    if not svdquant:
+        root = _find_comfyui_root()
+        if root:
+            return os.path.join(root, OUTPUT_SUBDIR)
+    return os.path.join(os.path.dirname(os.path.abspath(src)), "SVDQuant")
+
+
+def _has_comfy_quant(path: str) -> bool:
+    """Cheap header-only check that the file is a quantized checkpoint."""
+    try:
+        with safe_open(path, framework="pt", device="cpu") as h:
+            return any(k.endswith("comfy_quant") for k in h.keys())
+    except Exception:
+        return False
+
+
+def _has_svdq_branch(path: str) -> bool:
+    """Cheap header-only check that the file carries the low-rank branch (svdq/svdq8)."""
+    try:
+        with safe_open(path, framework="pt", device="cpu") as h:
+            return any(k.endswith(".svdq_l1") for k in h.keys())
+    except Exception:
+        return False
+
+
 def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
                     rank_alloc: str = "uniform", act_stats: str | None = None
                     ) -> tuple[str, str | None]:
@@ -1208,7 +1247,8 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
         suffix = "{}-convrot".format(fmt_name.upper())
     else:
         suffix = "FP8"
-    return os.path.join(os.path.dirname(src), "SVDQuant", "{}-{}.safetensors".format(stem, suffix)), note
+    # resolve_format returns rank 0 for the branchless formats, so rank is the svdq flag.
+    return os.path.join(default_out_dir(src, svdquant=bool(rank)), "{}-{}.safetensors".format(stem, suffix)), note
 
 
 def _display_path(path: str) -> str:
@@ -1271,7 +1311,10 @@ def main():
                          "RMS, so the branch spends its capacity on the directions the model "
                          "actually drives instead of on the largest weights. Costs nothing "
                          "at runtime -- same rank, format, size and kernel")
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--out", default=None,
+                    help="output path (default: SVDQuant/ next to the source models for "
+                         "svdq/svdq8, <ComfyUI>/output/diffusion_models/ for the other "
+                         "formats; named <stem>-<format tags>.safetensors)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED,
                     help="seed for the randomized low-rank SVD, so a build is reproducible "
