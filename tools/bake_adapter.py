@@ -3,6 +3,8 @@
     python tools/bake_adapter.py raw.safetensors --lora Krea2/realism_engine.safetensors \
         --format svdq --rank 256 --variant base --act-stats krea2_act_stats_base.safetensors
 
+Omitting `src` and/or `--lora` drops into interactive selection, like `quantize_krea2.py`:
+
 Why this exists. A LoKr, LoHa or OFT cannot fold into the low-rank branch, so the node has
 two choices at runtime and neither is free: compute the adapter every forward (exact, and on
 a 3090 at 1440x1920 that is +1.8 s per model call), or hand it to ComfyUI, which rewrites the
@@ -38,11 +40,18 @@ import torch  # noqa: E402
 # the pack sits in `ComfyUI/custom_nodes/`: from a working copy anywhere else, even `--help`
 # died on `No module named 'comfy'` with nothing to say about why.
 from quantize_krea2 import (  # noqa: E402
+    DEFAULT_SEED,
     LAYER_PREFIXES,
+    REFINE_TOL,
+    _find_comfyui_root,
+    _select_format,
+    _select_model,
+    _select_rank,
     convert,
     derive_out_path,
     detect_prefix,
     resolve_format,
+    source_kind,
 )
 
 import comfy.lora  # noqa: E402
@@ -155,26 +164,76 @@ def preflight(src: str, patches: dict) -> None:
     print("  preflight ok ({} patch shape(s))".format(len(probes)), flush=True)
 
 
+def _select_lora() -> list[tuple[str, float]]:
+    """Interactive LoRA picker: several allowed, optional strength per pick."""
+    comfy_root = _find_comfyui_root()
+    if not comfy_root:
+        raise SystemExit("Cannot find ComfyUI root. Set COMFYUI_PATH or run from inside ComfyUI.")
+    loras_dir = os.path.join(comfy_root, "models", "loras", "Krea-2")
+    if not os.path.isdir(loras_dir):
+        raise SystemExit("LoRA directory not found: {}".format(loras_dir))
+    files = sorted(f for f in os.listdir(loras_dir)
+                   if f.endswith(".safetensors")
+                   and os.path.isfile(os.path.join(loras_dir, f)))
+    if not files:
+        raise SystemExit("No LoRAs found in {}".format(loras_dir))
+
+    print("\nLoRAs (pick as many as you like, 'number:strength' for a custom strength):")
+    for i, f in enumerate(files, 1):
+        print("  {}. {}".format(i, f))
+    print("  d. Done")
+
+    selected: list[tuple[str, float]] = []
+    while True:
+        choice = input("Select LoRA (d when done): ").strip()
+        if choice.lower() in ("d", "done", ""):
+            break
+        num, _, strength = choice.rpartition(":")
+        if num:
+            try:
+                idx = int(num) - 1
+                if 0 <= idx < len(files):
+                    selected.append((os.path.join(loras_dir, files[idx]),
+                                     float(strength) if strength else 1.0))
+                    continue
+            except ValueError:
+                pass
+        print("Invalid choice.")
+    if not selected:
+        raise SystemExit("No LoRA selected; nothing to bake.")
+    return selected
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("src", help="the high-precision checkpoint (raw.safetensors, turbo...)")
-    ap.add_argument("--lora", action="append", required=True, metavar="PATH[:STRENGTH]",
-                    help="repeat to bake several, in order; strength defaults to 1.0")
+    ap.add_argument("src", nargs="?", default=None,
+                    help="the high-precision checkpoint (omit to select interactively)")
+    ap.add_argument("--lora", action="append", default=None, metavar="PATH[:STRENGTH]",
+                    help="repeat to bake several, in order; strength defaults to 1.0 "
+                         "(omit to pick interactively)")
     ap.add_argument("--format", choices=["int8", "w4a4", "w4a8", "svdq", "svdq8", "fp8"],
                     default="svdq")
     ap.add_argument("--groupsize", type=int, default=256)
     ap.add_argument("--rank", type=int, default=256)
     ap.add_argument("--rank-alloc", default="uniform")
-    ap.add_argument("--refine-iters", type=int, default=100)
+    ap.add_argument("--refine-iters", type=int, default=10000)
+    ap.add_argument("--refine-tol", type=float, default=REFINE_TOL, metavar="FRACTION",
+                    help="svdq/svdq8 only: stop refining once an iteration improves a layer's "
+                         "reconstruction error by less than this fraction (default %(default)s). "
+                         "Lower = more iterations, less return; 0 = run nearly all --refine-iters")
+    ap.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                    help="seed for the randomized low-rank SVD, so a build is reproducible "
+                         "(default %(default)s). Pass -1 for the old unseeded behaviour")
     ap.add_argument("--variant", choices=["turbo", "base", "unknown"], default="unknown")
     ap.add_argument("--act-stats", default=None)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    src_omitted = args.src is None
     loras = []
-    for spec in args.lora:
+    for spec in args.lora or []:
         path, _, strength = spec.rpartition(":")
         # A bare Windows path has a colon in it ("D:/loras/x.safetensors"), so only treat the
         # tail as a strength when it actually parses as one.
@@ -182,6 +241,19 @@ def main():
             loras.append((path, float(strength)) if path else (spec, 1.0))
         except ValueError:
             loras.append((spec, 1.0))
+
+    if src_omitted:
+        args.src, src_kind = _select_model()
+    else:
+        src_kind = source_kind(args.src)
+    if not loras:
+        loras = _select_lora()
+    if src_omitted:
+        # Same flow as quantize_krea2: a bare run asks about format and rank too.
+        if args.format == ap.get_default("format"):
+            args.format = _select_format(src_kind)
+        if args.rank == ap.get_default("rank") and args.format in ("svdq", "svdq8"):
+            args.rank = _select_rank()
 
     fmt, rank = resolve_format(args.format, args.rank, rank_was_set=True)
 
@@ -205,6 +277,7 @@ def main():
 
     convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
             variant=args.variant, rank_alloc=args.rank_alloc, act_stats=args.act_stats,
+            refine_tol=args.refine_tol, seed=None if args.seed < 0 else args.seed,
             weight_patch=make_weight_patch(patches, applied))
 
     missing = set(patches) - set(applied)

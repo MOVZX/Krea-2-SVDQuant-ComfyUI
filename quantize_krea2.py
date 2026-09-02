@@ -106,7 +106,7 @@ except Exception as exc:  # pragma: no cover - depends on the ComfyUI build
 
 # Relative improvement the refinement loop must keep making to earn another iteration. See
 # `svdquant_split` for the traced numbers this default comes from.
-REFINE_TOL = 0.001
+REFINE_TOL = 0.0001
 
 # Deterministic by default. The low-rank split is a *randomized* SVD, so an unseeded build is
 # irreproducible even on the same machine -- two files that differ by ~1e-4 per weight and by
@@ -249,41 +249,65 @@ def _free_comfyui_memory() -> None:
 
 
 def _select_model() -> tuple[str, str]:
-    """Interactive model selector: list eligible models, return (path, source kind)."""
+    """Interactive model selector: list eligible models, return (path, source kind).
+
+    Scans models/diffusion_models/Krea-2/ plus output/diffusion_models/ (and its Krea-2/
+    subfolder): models get downloaded or copied to any of them. The quantizer's own
+    outputs are excluded: a source drops out once any derivative of it exists, and a
+    marker-verified derivative is not offered as a source in its own right.
+    """
     comfy_root = _find_comfyui_root()
     if not comfy_root:
         raise SystemExit("Cannot find ComfyUI root. Set COMFYUI_PATH or run from inside ComfyUI.")
 
     models_dir = os.path.join(comfy_root, "models", "diffusion_models", "Krea-2")
-    if not os.path.isdir(models_dir):
-        raise SystemExit("Krea-2 models directory not found: {}".format(models_dir))
+    output_dir = os.path.join(comfy_root, OUTPUT_SUBDIR)
+    scan_dirs = [models_dir, output_dir, os.path.join(output_dir, "Krea-2")]
+    if not any(os.path.isdir(d) for d in scan_dirs):
+        raise SystemExit("No model directory found: {} or {}".format(models_dir, output_dir))
 
-    # SVDQuant builds live in Krea-2/SVDQuant/; the other quantized formats land in
-    # output/diffusion_models/, which also holds non-quantized files (merges, ...), so
-    # only marker-verified stems count there.
-    quantized_stems = set()
+    # Stems of every file we scan, plus the ones known to be quantized outputs (in
+    # SVDQuant/ or marker-verified). output/diffusion_models/ holds the branchless
+    # quantized builds next to regular model files, so only markers tell them apart.
+    all_stems: set[str] = set()
+    quantized_stems: set[str] = set()
     for d, check_marker in ((os.path.join(models_dir, "SVDQuant"), False),
-                            (os.path.join(comfy_root, OUTPUT_SUBDIR), True)):
+                            *[(d, True) for d in scan_dirs]):
         if not os.path.isdir(d):
             continue
         for n in os.listdir(d):
-            if n.endswith(".safetensors") and (not check_marker or _has_comfy_quant(os.path.join(d, n))):
-                quantized_stems.add(os.path.splitext(n)[0])
+            if not n.endswith(".safetensors"):
+                continue
+            stem = os.path.splitext(n)[0]
+            all_stems.add(stem)
+            if not check_marker or _has_comfy_quant(os.path.join(d, n)):
+                quantized_stems.add(stem)
 
     candidates = []
-    for f in sorted(os.listdir(models_dir)):
-        if not f.endswith(".safetensors"):
+    seen = set()
+    for d in scan_dirs:
+        if not os.path.isdir(d):
             continue
-        full = os.path.join(models_dir, f)
-        if not os.path.isfile(full):
-            continue
-        stem = os.path.splitext(f)[0]
-        if any(qs.startswith(stem + "-") for qs in quantized_stems):
-            continue
-        kind = source_kind(full)
-        if kind == "other":
-            continue
-        candidates.append((full, kind))
+        for f in sorted(os.listdir(d)):
+            if not f.endswith(".safetensors"):
+                continue
+            full = os.path.join(d, f)
+            real = os.path.realpath(full)
+            if not os.path.isfile(full) or real in seen:
+                continue
+            seen.add(real)
+            stem = os.path.splitext(f)[0]
+            # A marker-verified file named "<other-stem>-..." is a quantized build of
+            # that other model, not a source of its own.
+            if stem in quantized_stems and any(stem.startswith(t + "-") for t in all_stems):
+                continue
+            # A source with an existing derivative is not offered again.
+            if any(qs.startswith(stem + "-") for qs in quantized_stems):
+                continue
+            kind = source_kind(real)
+            if kind == "other":
+                continue
+            candidates.append((real, kind))
 
     if not candidates:
         raise SystemExit("No eligible models found (BF16/FP16, FP8, INT8 or mixed source, not yet quantized).")
@@ -299,7 +323,7 @@ def _select_model() -> tuple[str, str]:
             tag = "  [mixed FP8/INT8 source - expect quality loss]"
         else:
             tag = ""
-        print("  {}. {} ({:.1f} GB){}".format(i, os.path.basename(path), size_gb, tag))
+        print("  {}. {} ({:.1f} GB){}".format(i, os.path.relpath(path, comfy_root), size_gb, tag))
     print("  0. Exit")
 
     while True:
@@ -660,7 +684,7 @@ def _act_weighting(act_rms: torch.Tensor | None, in_features: int, device, floor
 
 
 def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
-                   refine_iters: int = 100, act_rms: torch.Tensor | None = None,
+                   refine_iters: int = 10000, act_rms: torch.Tensor | None = None,
                    refine_tol: float = REFINE_TOL, seed: int | None = None):
     """SVDQuant ordering: pull a low-rank bf16 branch out of W, quantize the residual.
 
@@ -686,7 +710,7 @@ def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
         stop at              iterations   reconstruction error
         1e-6 absolute (old)     ~80        baseline
         0.5% relative            ~9        +4.3%
-        0.1% relative (now)     ~22        +2.0%
+        0.1% relative           ~22        +2.0%
 
     Conversion goes from ~14 minutes to ~4. The 2% is reconstruction error, which this repo
     has three times measured to be a poor predictor of image outcome (see `--rank-alloc` in
@@ -710,6 +734,10 @@ def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
     numbers from the same seed, and their GEMM reduction orders differ too, so a CPU build
     and a GPU build of the same checkpoint will never be equal. `convert` records the device
     in the metadata for that reason.
+
+    Returns (residual, l1, l2, stats). `stats` says which iteration stopped the loop and
+    why (tol / budget / nan / single-shot), plus the final relative error -- `convert`
+    prints it per layer so a build log answers "how far did refinement actually run".
 
     Returns None for a degenerate weight (all-zero, or one that makes the error metric
     non-finite); the caller quantizes those without a branch rather than aborting.
@@ -760,9 +788,16 @@ def _svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
         return None
     qw = torch.zeros((), device=w.device, dtype=torch.float32)
 
+    # How the loop ended, per layer: `convert` prints this so a build log answers "which
+    # iteration stopped, and why" instead of the refinement budget being a mystery.
+    budget = max(1, refine_iters)
+    iters = 0
+    stop = "budget"
+    last_gain = 0.0
     best = None
     best_err = float("inf")
-    for _ in range(max(1, refine_iters)):
+    for i in range(budget):
+        iters = i + 1
         target = w - qw
         if d is None:
             l1, l2 = svd_lowrank(target, rank, oversample=16, niter=2)
@@ -791,12 +826,21 @@ def _svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
         # ever update `best` -- it would burn all `refine_iters` and return the last
         # split rather than the best one.
         if not math.isfinite(err):
+            stop = "nan"
             break
-        if best is not None and err >= best_err * (1.0 - refine_tol):
-            break  # refinement has stopped paying off
+        if best is not None:
+            last_gain = (best_err - err) / best_err
+            if last_gain <= refine_tol:
+                stop = "tol"  # refinement has stopped paying off
+                break
         best_err, best = err, (residual, l1, l2)
 
-    return best
+    if best is None:
+        return None
+    if stop == "budget" and budget <= 1:
+        stop = "single-shot"
+    return best + ({"iters": iters, "budget": budget, "stop": stop,
+                    "last_gain": last_gain, "rel_err": best_err, "tol": refine_tol},)
 
 
 def _quantize_raw(weight: torch.Tensor, fmt: str, groupsize: int):
@@ -897,8 +941,20 @@ def check_act_stats_coverage(stats: dict, keys, prefix: str, ranks: dict, suffix
                              ", ".join(missing[:3])))
 
 
+def _refine_stop_text(s: dict) -> str:
+    """Human text for why one layer's refinement loop stopped."""
+    if s["stop"] == "tol":
+        return "tol-stop (gain {:.1e} <= {:.0e})".format(s["last_gain"], s["tol"])
+    if s["stop"] == "budget":
+        return ("BUDGET EXHAUSTED (last gain {:.1e} > {:.0e}, still improving)"
+                .format(s["last_gain"], s["tol"]))
+    if s["stop"] == "nan":
+        return "non-finite error, stopped early"
+    return "single-shot (refinement disabled)"
+
+
 def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", rank: int = 0,
-            refine_iters: int = 100, variant: str = "unknown", progress_cb=None,
+            refine_iters: int = 10000, variant: str = "unknown", progress_cb=None,
             rank_alloc: str = "uniform", act_stats: str | None = None,
             weight_patch=None, refine_tol: float = REFINE_TOL,
             seed: int | None = DEFAULT_SEED):
@@ -926,6 +982,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     observed_leaves: set[str] = set()
     used_ranks: set[int] = set()
     clamped: dict[str, int] = {}
+    refine_log: list[tuple[str, dict]] = []
     stats = load_act_stats(act_stats) if act_stats else {}
     t0 = time.time()
 
@@ -998,12 +1055,19 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                                   "quantizing it without a low-rank branch".format(layer),
                                   flush=True)
                         else:
-                            w, l1, l2 = split
+                            w, l1, l2, rstat = split
                             out["{}.svdq_l1".format(layer)] = l1.cpu()
                             out["{}.svdq_l2".format(layer)] = l2.cpu()
                             branched += 1
                             used_ranks.add(int(l1.shape[1]))
                             del l1, l2
+                            refine_log.append((layer, rstat))
+                            # One line per branched layer: which iteration stopped the loop
+                            # and why. For a branched build these lines are the progress
+                            # report, so the every-32-layers line below stays quiet.
+                            print("  refine [{}/{}] {}  {} iters, rel err {:.2e}  {}".format(
+                                branched, expected_layers, layer, rstat["iters"],
+                                rstat["rel_err"], _refine_stop_text(rstat)), flush=True)
                     qdata, scales, conf = quantize_weight(w, fmt, groupsize)
                     out[key] = qdata.cpu()
                     for name, value in scales.items():
@@ -1017,8 +1081,9 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                                         quantized, time.time() - t0))
                     if quantized % 32 == 0:
                         torch.cuda.empty_cache()
-                        print(f"  [{i + 1}/{len(keys)}] quantized {quantized} layers "
-                              f"({time.time() - t0:.0f}s)", flush=True)
+                        if not rank:
+                            print(f"  [{i + 1}/{len(keys)}] quantized {quantized} layers "
+                                  f"({time.time() - t0:.0f}s)", flush=True)
                     continue
             if key in stale_companions:
                 continue
@@ -1053,6 +1118,26 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
               "them fairly.".format(
                   rank_alloc, ", ".join("{}={}".format(k, v) for k, v in sorted(clamped.items())),
                   rank), flush=True)
+
+    if refine_log:
+        n = len(refine_log)
+        first = refine_log[0][1]
+        iters = sorted(s["iters"] for _, s in refine_log)
+        errs = sorted(s["rel_err"] for _, s in refine_log)
+        stops = {}
+        for _, s in refine_log:
+            stops[s["stop"]] = stops.get(s["stop"], 0) + 1
+        print("refinement: {} layers (budget {} iters, tol {:.0e})".format(
+            n, first["budget"], first["tol"]), flush=True)
+        print("  iters/layer: min {}  median {}  max {}".format(
+            iters[0], iters[n // 2], iters[-1]), flush=True)
+        print("  stop: " + ", ".join("{} {}".format(k, v) for k, v in sorted(stops.items())),
+              flush=True)
+        print("  rel err: min {:.2e}  median {:.2e}  max {:.2e}".format(
+            errs[0], errs[n // 2], errs[-1]), flush=True)
+        if stops.get("budget", 0) > 0:
+            print("  warning: {} layer(s) ran out of {} iters while still improving; "
+                  "raise refine_iters".format(stops["budget"], first["budget"]), flush=True)
 
     created = len(out) - kept - quantized
     factors = "" if not rank else " + {} low-rank factors".format(branched * 2)
@@ -1290,7 +1375,7 @@ def main():
                          "uniform = same rank everywhere. gqa = byte-neutral reallocation "
                          "towards the GQA kv projections, which absorb ~2x the error at a "
                          "third of the branch cost (see RANK_ALLOCATIONS)")
-    ap.add_argument("--refine-iters", type=int, default=100,
+    ap.add_argument("--refine-iters", type=int, default=10000,
                     help="svdq/svdq8 only: refine the low-rank branch against the quantization "
                          "error, keeping the best (0 = plain single-shot SVD, much faster "
                          "but ~10%% more reconstruction error). This is a cap; --refine-tol "
@@ -1298,7 +1383,7 @@ def main():
     ap.add_argument("--refine-tol", type=float, default=REFINE_TOL, metavar="FRACTION",
                     help="svdq/svdq8 only: stop refining a layer once an iteration improves its "
                          "reconstruction error by less than this fraction (default %(default)s "
-                         "= 0.1%%). Lower means more iterations for less return: 0.001 takes "
+                         "= 0.01%%). Lower means more iterations for less return: 0.001 takes "
                          "~22 iterations per layer, 0.005 takes ~9 for 2%% more error, and 0 "
                          "restores the old behaviour of running nearly all --refine-iters")
     ap.add_argument("--variant", choices=["turbo", "base", "unknown"], default="turbo",
@@ -1401,6 +1486,10 @@ def main():
         print(note, flush=True)
 
     def cli_progress(done, total, message):
+        # Branched builds already print one informative line per layer; the bar would just
+        # add 224 more lines. The final "writing ..." call still draws once.
+        if rank and not message.startswith("writing"):
+            return
         pct = done / total * 100 if total else 0
         bar_len = 30
         filled = int(bar_len * done / total) if total else 0

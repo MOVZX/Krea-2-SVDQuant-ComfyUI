@@ -101,12 +101,12 @@ class Krea2SVDQuantQuantize:
                                "unless you are re-testing that.",
                 }),
                 "refine_iters": ("INT", {
-                    "default": 100, "min": 0, "max": 200,
-                    "tooltip": "svdq/svdq8 only. 0 is a single-shot SVD split (~54s); 100 refines "
-                               "the branch against the quantization error and early-stops "
-                               "(~5.7min). Keep this on if rank > 16: refinement is what "
-                               "makes rank behave. Without it, raising rank costs file size "
-                               "and buys nothing measurable.",
+                    "default": 10000, "min": 0, "max": 10000,
+                    "tooltip": "svdq/svdq8 only. 0 is a single-shot SVD split (~54s). The "
+                               "default refines the branch against the quantization error and "
+                               "early-stops once improvement stops paying. Keep this on if rank > 16: "
+                               "refinement is what makes rank behave. Without it, raising rank "
+                               "costs file size and buys nothing measurable.",
                 }),
                 "groupsize": ("INT", {
                     "default": 256, "min": 32, "max": 1024, "step": 32,
@@ -345,7 +345,7 @@ class Krea2SVDQuantQuantizeAllInOne:
                     "tooltip": "svdq only: size of the low-rank branch on the diffusion model.",
                 }),
                 "refine_iters": ("INT", {
-                    "default": 100, "min": 0, "max": 200,
+                    "default": 10000, "min": 0, "max": 10000,
                     "tooltip": "svdq only (if source_dit is BF16). Refines the branch against "
                                "quantization error. Ignored if source_dit is already quantized.",
                 }),

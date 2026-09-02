@@ -40,7 +40,7 @@ def main():
                     help="text encoder side. No low-rank branch either way")
     ap.add_argument("--rank", type=int, default=64, help="diffusion side, svdq only")
     ap.add_argument("--rank-alloc", default="uniform")
-    ap.add_argument("--refine-iters", type=int, default=100)
+    ap.add_argument("--refine-iters", type=int, default=10000)
     ap.add_argument("--refine-tol", type=float, default=REFINE_TOL)
     ap.add_argument("--groupsize", type=int, default=256)
     ap.add_argument("--act-stats", default=None, help="diffusion side only")

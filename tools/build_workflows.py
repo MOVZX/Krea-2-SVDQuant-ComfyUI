@@ -682,8 +682,8 @@ WHICH RANK (svdq only)
   No LoRA planned -> 64. 128 and 256 measured the same.
   LoRAs planned  -> 256. It wins clearly there; 64 loses most of
                     its advantage once a LoRA is patched in.
-  Keep refine_iters at 100. At 0 the split is single-shot (~54s
-  instead of ~5.7min) and raising rank then buys nothing.
+  Keep refine_iters at 10000. At 0 the split is single-shot (~54s
+  instead of a few minutes) and raising rank then buys nothing.
 
 WHAT TO EXPECT WHILE IT RUNS
 - The queue is BLOCKED. Nothing else generates. 54s to ~6 min.
@@ -785,7 +785,7 @@ def build_quantize():
     g.add("Krea2SVDQuantQuantize", 1, 0.9,
                   outputs=[("summary", "STRING")],
                   widgets=[("source_model", "krea2_bf16.safetensors"), ("format", "svdq"),
-                           ("rank", 64), ("rank_alloc", "uniform"), ("refine_iters", 100),
+                           ("rank", 64), ("rank_alloc", "uniform"), ("refine_iters", 10000),
                            ("groupsize", 256), ("variant", "turbo"), ("output_name", ""),
                            ("overwrite", False), ("act_stats", ""), ("seed", 0)],
           title="2. Quantize - set source_model and act_stats, then Queue", colour=TEAL,
@@ -818,7 +818,7 @@ Resulting file: ~12 GB in models/checkpoints/, loaded with Krea2 SVDQuant Checkp
                    ("format", "svdq"),
                    ("te_format", "w4a4"),
                    ("rank", 64),
-                   ("refine_iters", 100),
+                   ("refine_iters", 10000),
                    ("groupsize", 256),
                    ("variant", "turbo"),
                    ("output_name", ""),
@@ -881,7 +881,7 @@ def build_quantize_calibrated():
                   inputs=[("act_stats", "STRING")],
                   outputs=[("summary", "STRING")],
                   widgets=[("source_model", "krea2_bf16.safetensors"), ("format", "svdq"),
-                           ("rank", 64), ("rank_alloc", "uniform"), ("refine_iters", 100),
+                           ("rank", 64), ("rank_alloc", "uniform"), ("refine_iters", 10000),
                            ("groupsize", 256), ("variant", "turbo"), ("output_name", ""),
                            ("overwrite", False), ("act_stats", ""), ("seed", 0)],
                   title="Quantize - source_model must match the loader above", colour=TEAL,
