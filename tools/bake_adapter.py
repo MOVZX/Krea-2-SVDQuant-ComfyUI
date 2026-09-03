@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))                 # the node package
@@ -43,7 +44,12 @@ from quantize_krea2 import (  # noqa: E402
     DEFAULT_SEED,
     LAYER_PREFIXES,
     REFINE_TOL,
+    _BRANCHED_FORMATS,
+    _FMT_LABELS,
+    _display_path,
     _find_comfyui_root,
+    _fmt_elapsed,
+    _free_comfyui_memory,
     _select_format,
     _select_model,
     _select_rank,
@@ -226,10 +232,15 @@ def main():
                     help="seed for the randomized low-rank SVD, so a build is reproducible "
                          "(default %(default)s). Pass -1 for the old unseeded behaviour")
     ap.add_argument("--variant", choices=["turbo", "base", "unknown"], default="unknown")
-    ap.add_argument("--act-stats", default=None)
+    ap.add_argument("--act-stats", default=None, metavar="PATH",
+                    help="svdq/svdq8 only: activation statistics from the Krea2 SVDQuant "
+                         "Capture nodes. Weights the low-rank split by per-input-channel "
+                         "activation RMS. Auto-detected as "
+                         "ComfyUI/output/svdq_act_stats/<stem>_act_stats.safetensors when omitted")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    t_start = time.time()
 
     src_omitted = args.src is None
     loras = []
@@ -255,12 +266,67 @@ def main():
         if args.rank == ap.get_default("rank") and args.format in ("svdq", "svdq8"):
             args.rank = _select_rank()
 
-    fmt, rank = resolve_format(args.format, args.rank, rank_was_set=True)
+    if args.act_stats:
+        if args.format not in _BRANCHED_FORMATS:
+            raise SystemExit("--act-stats only applies to the svdq formats: it weights the "
+                             "low-rank split, and the other formats have no branch")
+        if not os.path.exists(args.act_stats):
+            raise SystemExit("--act-stats file not found: {}".format(args.act_stats))
+    elif args.format in _BRANCHED_FORMATS:
+        # Same auto-detect as quantize_krea2: a forgotten --act-stats must not silently
+        # build an unweighted checkpoint.
+        derived = os.path.splitext(os.path.basename(args.src))[0] + "_act_stats.safetensors"
+        comfy_root = _find_comfyui_root()
+        if comfy_root:
+            candidate = os.path.join(comfy_root, "output", "svdq_act_stats", derived)
+            if os.path.isfile(candidate):
+                args.act_stats = candidate
+        if not args.act_stats:
+            stem = os.path.splitext(os.path.basename(args.src))[0]
+            expected = os.path.join("svdq_act_stats", stem + "_act_stats.safetensors")
+            raise SystemExit(
+                f"act_stats file not found under ComfyUI/output/{expected}\n"
+                f"Run the Krea2 SVDQuant Capture nodes first to generate it.")
+
+    # RuntimeError is the shared failure type (see `convert`); the CLI wants SystemExit so it
+    # prints one clean line instead of a traceback.
+    try:
+        fmt, rank = resolve_format(args.format, args.rank,
+                                   rank_was_set=args.rank != ap.get_default("rank"))
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
 
     from safetensors import safe_open
     with safe_open(args.src, framework="pt", device="cpu") as handle:
         keys = list(handle.keys())
     prefix = detect_prefix(keys, default=LAYER_PREFIXES[0])
+
+    out = args.out
+    note = None
+    if out is None:
+        out, note = derive_out_path(args.src, args.format, rank, args.variant, args.rank_alloc,
+                                    args.act_stats)
+        stem, ext = os.path.splitext(out)
+        out = "{}-baked{}".format(stem, ext)
+
+    def _hdr(label, value):
+        return "{:<14} {}".format(label, value)
+
+    lines = [
+        _hdr("Model         :", _display_path(args.src)),
+        _hdr("LoRAs         :", ", ".join(os.path.basename(p) for p, _ in loras)),
+        _hdr("Act. Stats    :", _display_path(args.act_stats) if args.act_stats else "none"),
+        _hdr("Format        :", _FMT_LABELS[args.format]),
+    ]
+    if rank:
+        lines += [_hdr("Rank          :", str(rank)),
+                  _hdr("Refine Iters  :", str(args.refine_iters)),
+                  _hdr("Refine Tol    :", str(args.refine_tol))]
+    lines.append(_hdr("Output        :", _display_path(out)))
+    print("\n".join(lines))
+    print("---")
+    if note:
+        print(note, flush=True)
 
     print("baking {} adapter(s) into {}".format(len(loras), os.path.basename(args.src)),
           flush=True)
@@ -268,17 +334,34 @@ def main():
     applied: dict[str, int] = {}
     preflight(args.src, patches)
 
-    out = args.out
-    if out is None:
-        out, _ = derive_out_path(args.src, args.format, rank, args.variant, args.rank_alloc,
-                                 args.act_stats)
-        stem, ext = os.path.splitext(out)
-        out = "{}-baked{}".format(stem, ext)
+    def cli_progress(done, total, message):
+        # Branched builds already print one informative line per layer; the bar would just
+        # add 224 more lines. The final "writing ..." call still draws once.
+        if rank and not message.startswith("writing"):
+            return
+        pct = done / total * 100 if total else 0
+        bar_len = 30
+        filled = int(bar_len * done / total) if total else 0
+        bar = "█" * filled + "░" * (bar_len - filled)
+        sys.stdout.write(f"\r[{bar}] {done}/{total} ({pct:.0f}%) {message}")
+        sys.stdout.flush()
+        if done >= total:
+            sys.stdout.write("\n")
 
-    convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
-            variant=args.variant, rank_alloc=args.rank_alloc, act_stats=args.act_stats,
-            refine_tol=args.refine_tol, seed=None if args.seed < 0 else args.seed,
-            weight_patch=make_weight_patch(patches, applied))
+    # Validation and preflight passed; only now unload whatever ComfyUI was holding.
+    _free_comfyui_memory()
+
+    try:
+        convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
+                variant=args.variant, rank_alloc=args.rank_alloc, act_stats=args.act_stats,
+                refine_tol=args.refine_tol, progress_cb=cli_progress,
+                seed=None if args.seed < 0 else args.seed,
+                weight_patch=make_weight_patch(patches, applied))
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
+
+    elapsed = time.time() - t_start
+    print("\ntotal elapsed: {} ({:.0f}s)".format(_fmt_elapsed(elapsed), elapsed))
 
     missing = set(patches) - set(applied)
     if missing:
