@@ -194,16 +194,16 @@ def _select_lora() -> list[tuple[str, float]]:
         choice = input("Select LoRA (d when done): ").strip()
         if choice.lower() in ("d", "done", ""):
             break
-        num, _, strength = choice.rpartition(":")
-        if num:
-            try:
-                idx = int(num) - 1
-                if 0 <= idx < len(files):
-                    selected.append((os.path.join(loras_dir, files[idx]),
-                                     float(strength) if strength else 1.0))
-                    continue
-            except ValueError:
-                pass
+        num, _, strength = choice.partition(":")
+        try:
+            idx = int(num.strip()) - 1
+            if 0 <= idx < len(files):
+                s = strength.strip()
+                selected.append((os.path.join(loras_dir, files[idx]),
+                                 float(s) if s else 1.0))
+                continue
+        except ValueError:
+            pass
         print("Invalid choice.")
     if not selected:
         raise SystemExit("No LoRA selected; nothing to bake.")
