@@ -25,8 +25,8 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 
-from .quantize_krea2 import (_has_svdq_branch, default_out_dir, detect_architecture,
-                             detect_prefix)
+from .quantize_krea2 import (_find_comfyui_root, _has_svdq_branch, default_out_dir,
+                             detect_architecture, detect_prefix)
 from .sage_mask_guard import install_mask_guard
 from .svdquant_diag import (BUF_L1, BUF_L2, _CATEGORY, branch_factors,  # noqa: F401
                             log_dispatch, quantized_linears)
@@ -810,17 +810,48 @@ def load_svdquant_checkpoint(path: str, output_vae: bool = True, output_clip: bo
     return patcher, clip, vae, status
 
 
-def _svdquant_candidates() -> list[str]:
-    """Bare filenames of loadable SVDQuant checkpoints, from both home folders."""
-    names = {os.path.basename(f) for f in folder_paths.get_filename_list("diffusion_models")
-             if f.startswith("Krea-2/SVDQuant/")}
+# Folders that may hold SVDQuant checkpoints, in resolution order. The model tree wins
+# over the ComfyUI output folders; inside the model tree the historical Krea-2/SVDQuant
+# stays first so a saved workflow keeps hitting the same file even if a copy lands in
+# the other folder later.
+_SVDQ_MODEL_SUBDIRS = ("Krea-2/SVDQuant", "SVDQuant")
+_SVDQ_OUTPUT_SUBDIRS = ("SVDQuant", "Krea-2/SVDQuant")
+
+
+def _svdquant_dirs() -> list[str]:
+    """The SVDQuant folders that exist, absolute, in resolution order. A name present in
+    several of them resolves to the first one listed."""
+    dirs = []
+    for base in folder_paths.get_folder_paths("diffusion_models"):
+        for sub in _SVDQ_MODEL_SUBDIRS:
+            d = os.path.join(base, sub)
+            if os.path.isdir(d):
+                dirs.append(d)
+    root = _find_comfyui_root()
+    if root:
+        for sub in _SVDQ_OUTPUT_SUBDIRS:
+            d = os.path.join(root, "output", sub)
+            if os.path.isdir(d):
+                dirs.append(d)
+    # output/diffusion_models/ also holds plain checkpoints (merges, w4a4/w4a8/int8/fp8
+    # builds); only its branch-carrying files are loadable here, but they belong in the
+    # search set.
     out_dir = default_out_dir()
     if os.path.isdir(out_dir):
-        # output/diffusion_models/ also holds plain checkpoints (merges, w4a4/w4a8/int8/
-        # fp8 builds); only files with the low-rank branch are loadable here, so verify
-        # the branch keys instead of assuming.
-        for f in os.listdir(out_dir):
-            if f.endswith(".safetensors") and _has_svdq_branch(os.path.join(out_dir, f)):
+        dirs.append(out_dir)
+    return dirs
+
+
+def _svdquant_candidates() -> list[str]:
+    """Bare filenames of loadable SVDQuant checkpoints, from every home folder.
+
+    Only files that actually carry the low-rank branch are listed: a branchless build
+    dropped into one of these folders loads through the stock UNETLoader, not here.
+    """
+    names = set()
+    for d in _svdquant_dirs():
+        for f in os.listdir(d):
+            if f.endswith(".safetensors") and _has_svdq_branch(os.path.join(d, f)):
                 names.add(f)
     return sorted(names)
 
@@ -828,18 +859,27 @@ def _svdquant_candidates() -> list[str]:
 def _resolve_model_name(model_name: str) -> str:
     """A bare filename or a saved relative path -> the absolute file.
 
-    Bare names are looked up in Krea-2/SVDQuant/ first (workflows saved earlier must keep
-    hitting the same file), then in the default output folder.
+    Bare names resolve in _svdquant_dirs order: the historical Krea-2/SVDQuant model
+    folder first, so workflows saved earlier keep hitting the same file. A path form
+    resolves against the diffusion_models folders first, then the ComfyUI root (which
+    covers output/SVDQuant/... and output/Krea-2/SVDQuant/...).
     """
     if "/" in model_name:
-        return folder_paths.get_full_path_or_raise("diffusion_models", model_name)
-    try:
-        return folder_paths.get_full_path_or_raise("diffusion_models", "Krea-2/SVDQuant/" + model_name)
-    except Exception:
-        direct = os.path.join(default_out_dir(), model_name)
-        if os.path.isfile(direct):
-            return direct
-        raise
+        try:
+            return folder_paths.get_full_path_or_raise("diffusion_models", model_name)
+        except Exception:
+            root = _find_comfyui_root()
+            if root:
+                p = os.path.join(root, model_name)
+                if os.path.isfile(p):
+                    return p
+            raise
+    for d in _svdquant_dirs():
+        p = os.path.join(d, model_name)
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError(
+        "model '{}' not found in: {}".format(model_name, ", ".join(_svdquant_dirs())))
 
 
 class Krea2SVDQuantW4A4Loader:
