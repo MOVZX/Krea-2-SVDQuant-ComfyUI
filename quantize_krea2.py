@@ -117,6 +117,20 @@ DEFAULT_SEED = 0
 _QUANT_SUFFIXES = ("attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo",
                    "mlp.gate", "mlp.up", "mlp.down")
 
+# Keys that describe a quantized weight instead of being one: the scales, the codebook, and
+# the marker ComfyUI reads to choose a dequantize path. Whenever a weight is rewritten its
+# companions have to be regenerated or dropped with it -- a stale `weight_scale` sitting next
+# to a fresh bf16 weight is read as truth by the loader.
+COMPANION_KEYS = ("weight_scale", "weight_scale_2", "input_scale", "weight_s_rel",
+                  "weight_s_channel", "weight_codebook", "weight_correction", "comfy_quant")
+
+FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2,
+              torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
+
+# dtypes that mean "stored quantized", for callers that walk every tensor in a file and need
+# to know which ones are not plain weights.
+QUANT_DTYPES = FP8_DTYPES + (torch.int8,)
+
 # What differs between models this quantizer can handle: the leaf names under `blocks.N.`,
 # how many blocks there are (progress reporting only), and which rank allocations apply.
 # One entry today; the table exists because the alternative is a module-level tuple closed
@@ -262,52 +276,62 @@ def _select_model() -> tuple[str, str]:
 
     models_dir = os.path.join(comfy_root, "models", "diffusion_models", "Krea-2")
     output_dir = os.path.join(comfy_root, OUTPUT_SUBDIR)
-    scan_dirs = [models_dir, output_dir, os.path.join(output_dir, "Krea-2")]
-    if not any(os.path.isdir(d) for d in scan_dirs):
+    if not os.path.isdir(models_dir) and not os.path.isdir(output_dir):
         raise SystemExit("No model directory found: {} or {}".format(models_dir, output_dir))
+
+    # Recursively find all .safetensors files under a directory.
+    def _walk_safetensors(root):
+        if not os.path.isdir(root):
+            return []
+        files = []
+        for dirpath, _, filenames in os.walk(root):
+            for f in filenames:
+                if f.endswith(".safetensors"):
+                    files.append(os.path.join(dirpath, f))
+        return files
 
     # Stems of every file we scan, plus the ones known to be quantized outputs (in
     # SVDQuant/ or marker-verified). output/diffusion_models/ holds the branchless
     # quantized builds next to regular model files, so only markers tell them apart.
     all_stems: set[str] = set()
     quantized_stems: set[str] = set()
-    for d, check_marker in ((os.path.join(models_dir, "SVDQuant"), False),
-                            *[(d, True) for d in scan_dirs]):
-        if not os.path.isdir(d):
-            continue
-        for n in os.listdir(d):
-            if not n.endswith(".safetensors"):
-                continue
-            stem = os.path.splitext(n)[0]
-            all_stems.add(stem)
-            if not check_marker or _has_comfy_quant(os.path.join(d, n)):
-                quantized_stems.add(stem)
+    svdquant_dir = os.path.join(models_dir, "SVDQuant")
+    for path in _walk_safetensors(svdquant_dir):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        all_stems.add(stem)
+        quantized_stems.add(stem)  # SVDQuant/ always means quantized, no marker check
+    for path in _walk_safetensors(models_dir):
+        if svdquant_dir and path.startswith(svdquant_dir):
+            continue  # already processed
+        stem = os.path.splitext(os.path.basename(path))[0]
+        all_stems.add(stem)
+        if _has_comfy_quant(path):
+            quantized_stems.add(stem)
+    for path in _walk_safetensors(output_dir):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        all_stems.add(stem)
+        if _has_comfy_quant(path):
+            quantized_stems.add(stem)
 
     candidates = []
     seen = set()
-    for d in scan_dirs:
-        if not os.path.isdir(d):
+    for path in sorted(_walk_safetensors(models_dir) + _walk_safetensors(output_dir)):
+        real = os.path.realpath(path)
+        if not os.path.isfile(path) or real in seen:
             continue
-        for f in sorted(os.listdir(d)):
-            if not f.endswith(".safetensors"):
-                continue
-            full = os.path.join(d, f)
-            real = os.path.realpath(full)
-            if not os.path.isfile(full) or real in seen:
-                continue
-            seen.add(real)
-            stem = os.path.splitext(f)[0]
-            # A marker-verified file named "<other-stem>-..." is a quantized build of
-            # that other model, not a source of its own.
-            if stem in quantized_stems and any(stem.startswith(t + "-") for t in all_stems):
-                continue
-            # A source with an existing derivative is not offered again.
-            if any(qs.startswith(stem + "-") for qs in quantized_stems):
-                continue
-            kind = source_kind(real)
-            if kind == "other":
-                continue
-            candidates.append((real, kind))
+        seen.add(real)
+        stem = os.path.splitext(os.path.basename(path))[0]
+        # A marker-verified file named "<other-stem>-..." is a quantized build of
+        # that other model, not a source of its own.
+        if stem in quantized_stems and any(stem.startswith(t + "-") for t in all_stems):
+            continue
+        # A source with an existing derivative is not offered again.
+        if any(qs.startswith(stem + "-") for qs in quantized_stems):
+            continue
+        kind = source_kind(real)
+        if kind == "other":
+            continue
+        candidates.append((real, kind))
 
     if not candidates:
         raise SystemExit("No eligible models found (BF16/FP16, FP8, INT8 or mixed source, not yet quantized).")
@@ -964,7 +988,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     types -- see `RANK_ALLOCATIONS`. Non-uniform allocations keep the same total branch bytes.
 
     `weight_patch(key, tensor) -> tensor` runs on every tensor as it is read, before anything
-    is quantized. `tools/bake_adapter.py` uses it to add a LoRA delta into the high-precision
+    is quantized. `Scripts/bake_krea2_adapter.py` uses it to add a LoRA delta into the high-precision
     weight, so the low-rank branch is fitted against the *merged* weight rather than the LoRA
     being requantized on top of a finished checkpoint. Streaming it here rather than writing a
     merged source out first matters in practice: the bf16 source is 24 GB.
@@ -1019,9 +1043,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
             if key.endswith(".weight"):
                 layer = key[: -len(".weight")]
                 if is_target(layer, prefix, suffixes):
-                    for suffix in ("weight_scale", "weight_scale_2", "input_scale",
-                                   "weight_s_rel", "weight_s_channel", "weight_codebook",
-                                   "weight_correction", "comfy_quant"):
+                    for suffix in COMPANION_KEYS:
                         stale_companions.add("{}.{}".format(layer, suffix))
 
         for i, key in enumerate(keys):
@@ -1184,11 +1206,9 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
         (hn,) = struct.unpack("<Q", f.read(8))
         qmeta = json.loads(f.read(hn)).get("__metadata__", {}).get("_quantization_metadata")
     if qmeta:
-        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2,
-                      torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
         layers = {k: v for k, v in json.loads(qmeta).get("layers", {}).items()
                   if isinstance(out.get("{}.weight".format(k)), torch.Tensor)
-                  and out["{}.weight".format(k)].dtype in fp8_dtypes}
+                  and out["{}.weight".format(k)].dtype in FP8_DTYPES}
         if layers:
             metadata["_quantization_metadata"] = json.dumps({"layers": layers})
     if progress_cb is not None:
@@ -1273,21 +1293,20 @@ def resolve_format(fmt_name: str, rank: int, rank_was_set: bool = True) -> tuple
     return fmt, (rank if ranked else 0)
 
 
-# The folder the plain (branchless) quantized checkpoints land in by default: under
-# ComfyUI/output/ so derived files never sit on top of the source models.
+# The folders quantized checkpoints land in by default, both under ComfyUI/output/ so
+# derived files never sit on top of the source models.
 OUTPUT_SUBDIR = os.path.join("output", "diffusion_models")
+OUTPUT_SVDQ_SUBDIR = os.path.join(OUTPUT_SUBDIR, "SVDQuant")
 
 
 def default_out_dir(src: str = "", svdquant: bool = False) -> str:
-    """SVDQuant builds (svdq/svdq8) go to SVDQuant/ next to the source models -- for the
-    usual Krea-2/ sources that is models/diffusion_models/Krea-2/SVDQuant/ -- where the
-    loader's dropdown scans. The plain w4a4 / w4a8 / int8 / fp8 builds go to
+    """SVDQuant builds (svdq / svdq8) go to <ComfyUI>/output/diffusion_models/SVDQuant/.
+    The branchless w4a4 / w4a8 / int8 / fp8 builds go to
     <ComfyUI>/output/diffusion_models/. Without a ComfyUI root (CLI run away from an
-    install) everything falls back to SVDQuant/ next to the source."""
-    if not svdquant:
-        root = _find_comfyui_root()
-        if root:
-            return os.path.join(root, OUTPUT_SUBDIR)
+    install) the output falls back to SVDQuant/ next to the source."""
+    root = _find_comfyui_root()
+    if root:
+        return os.path.join(root, OUTPUT_SVDQ_SUBDIR if svdquant else OUTPUT_SUBDIR)
     return os.path.join(os.path.dirname(os.path.abspath(src)), "SVDQuant")
 
 
@@ -1397,8 +1416,8 @@ def main():
                          "actually drives instead of on the largest weights. Costs nothing "
                          "at runtime -- same rank, format, size and kernel")
     ap.add_argument("--out", default=None,
-                    help="output path (default: SVDQuant/ next to the source models for "
-                         "svdq/svdq8, <ComfyUI>/output/diffusion_models/ for the other "
+                    help="output path (default: <ComfyUI>/output/diffusion_models/SVDQuant/ "
+                         "for svdq/svdq8, <ComfyUI>/output/diffusion_models/ for the other "
                          "formats; named <stem>-<format tags>.safetensors)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED,

@@ -25,8 +25,8 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 
-from .quantize_krea2 import (_find_comfyui_root, _has_svdq_branch, default_out_dir,
-                             detect_architecture, detect_prefix)
+from .quantize_krea2 import (_find_comfyui_root, _has_svdq_branch, detect_architecture,
+                             detect_prefix)
 from .sage_mask_guard import install_mask_guard
 from .svdquant_diag import (BUF_L1, BUF_L2, _CATEGORY, branch_factors,  # noqa: F401
                             log_dispatch, quantized_linears)
@@ -810,35 +810,31 @@ def load_svdquant_checkpoint(path: str, output_vae: bool = True, output_clip: bo
     return patcher, clip, vae, status
 
 
-# Folders that may hold SVDQuant checkpoints, in resolution order. The model tree wins
-# over the ComfyUI output folders; inside the model tree the historical Krea-2/SVDQuant
-# stays first so a saved workflow keeps hitting the same file even if a copy lands in
-# the other folder later.
-_SVDQ_MODEL_SUBDIRS = ("Krea-2/SVDQuant", "SVDQuant")
-_SVDQ_OUTPUT_SUBDIRS = ("SVDQuant", "Krea-2/SVDQuant")
+# Folders that may hold SVDQuant checkpoints, in resolution order. The ComfyUI output
+# folder wins: new builds land in output/diffusion_models/SVDQuant/. The model-tree
+# SVDQuant/ folders stay in the search set so pre-existing checkpoints and saved
+# workflows keep resolving.
+_SVDQ_LEGACY_MODEL_SUBDIRS = ("Krea-2/SVDQuant", "SVDQuant")
 
 
 def _svdquant_dirs() -> list[str]:
     """The SVDQuant folders that exist, absolute, in resolution order. A name present in
     several of them resolves to the first one listed."""
     dirs = []
-    for base in folder_paths.get_folder_paths("diffusion_models"):
-        for sub in _SVDQ_MODEL_SUBDIRS:
-            d = os.path.join(base, sub)
-            if os.path.isdir(d):
-                dirs.append(d)
     root = _find_comfyui_root()
     if root:
-        for sub in _SVDQ_OUTPUT_SUBDIRS:
+        # output/diffusion_models/SVDQuant/ is the home of new svdq/svdq8 builds.
+        # Its parent output/diffusion_models/ holds the branchless builds, but a stray
+        # branch-carrying file there is loadable here too, so it stays in the search set.
+        for sub in (os.path.join("diffusion_models", "SVDQuant"), "diffusion_models"):
             d = os.path.join(root, "output", sub)
             if os.path.isdir(d):
                 dirs.append(d)
-    # output/diffusion_models/ also holds plain checkpoints (merges, w4a4/w4a8/int8/fp8
-    # builds); only its branch-carrying files are loadable here, but they belong in the
-    # search set.
-    out_dir = default_out_dir()
-    if os.path.isdir(out_dir):
-        dirs.append(out_dir)
+    for base in folder_paths.get_folder_paths("diffusion_models"):
+        for sub in _SVDQ_LEGACY_MODEL_SUBDIRS:
+            d = os.path.join(base, sub)
+            if os.path.isdir(d):
+                dirs.append(d)
     return dirs
 
 
@@ -859,10 +855,10 @@ def _svdquant_candidates() -> list[str]:
 def _resolve_model_name(model_name: str) -> str:
     """A bare filename or a saved relative path -> the absolute file.
 
-    Bare names resolve in _svdquant_dirs order: the historical Krea-2/SVDQuant model
-    folder first, so workflows saved earlier keep hitting the same file. A path form
-    resolves against the diffusion_models folders first, then the ComfyUI root (which
-    covers output/SVDQuant/... and output/Krea-2/SVDQuant/...).
+    Bare names resolve in _svdquant_dirs order: the ComfyUI output folders first,
+    then the historical Krea-2/SVDQuant model folders so older saved workflows keep
+    hitting the same file. A path form resolves against the diffusion_models folders
+    first, then the ComfyUI root (which covers output/diffusion_models/SVDQuant/...).
     """
     if "/" in model_name:
         try:
@@ -909,11 +905,12 @@ class Krea2SVDQuantW4A4Loader:
             },
         }
 
-    RETURN_TYPES = ("MODEL", "STRING")
-    RETURN_NAMES = ("model", "status")
+    RETURN_TYPES = ("MODEL", "STRING", "STRING")
+    RETURN_NAMES = ("model", "status", "name")
     OUTPUT_TOOLTIPS = ("Wire this to a KSampler.",
                        "Rank, variant, size and which kernel the quantized layers will "
-                       "actually dispatch to. Read this if generation is slow.")
+                       "actually dispatch to. Read this if generation is slow.",
+                       "The checkpoint's bare name without folder or extension.")
     OUTPUT_NODE = True
     FUNCTION = "load"
     CATEGORY = _CATEGORY
@@ -938,15 +935,48 @@ class Krea2SVDQuantW4A4Loader:
         path = _resolve_model_name(model_name)
         patcher = load_svdquant_w4a4(path, vram_management=vram_management)
         status = getattr(patcher, "krea2_load_summary", "")
-        return {"ui": {"text": [status]}, "result": (patcher, status)}
+        name = os.path.splitext(model_name.replace("\\", "/").split("/")[-1])[0]
+        return {"ui": {"text": [status]}, "result": (patcher, status, name)}
 
 
 class Krea2SVDQuantCheckpointLoader:
     @classmethod
+    def _ckpt_paths(cls) -> list[str]:
+        """Every all-in-one checkpoint, output folder first, then the historical
+        models/checkpoints/ location."""
+        paths = []
+        out_dir = os.path.join(folder_paths.get_output_directory(), "checkpoints")
+        if os.path.isdir(out_dir):
+            for f in sorted(os.listdir(out_dir)):
+                if f.endswith(".safetensors"):
+                    paths.append(os.path.join(out_dir, f))
+        paths += folder_paths.get_full_paths("checkpoints")
+        return paths
+
+    @classmethod
+    def _resolve_ckpt(cls, ckpt_name: str) -> str:
+        """Bare name or saved relative path -> the absolute file."""
+        if "/" in ckpt_name:
+            try:
+                return folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+            except Exception:
+                out_dir = os.path.join(folder_paths.get_output_directory(), "checkpoints")
+                p = os.path.join(out_dir, ckpt_name)
+                if os.path.isfile(p):
+                    return p
+                raise
+        dirs = [os.path.dirname(p) for p in cls._ckpt_paths()]
+        for p in cls._ckpt_paths():
+            if os.path.basename(p) == ckpt_name:
+                return p
+        raise FileNotFoundError(
+            "checkpoint '{}' not found in: {}".format(ckpt_name, ", ".join(dirs)))
+
+    @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "ckpt_name": (folder_paths.get_filename_list("checkpoints"), {
+                "ckpt_name": ([os.path.basename(p) for p in cls._ckpt_paths()], {
                     "tooltip": "An all-in-one Krea2 checkpoint containing diffusion model, "
                                "quantized text encoder, and VAE. If it carries SVDQuant "
                                "branches (*.svdq_l1/*.svdq_l2), they will be attached automatically.",
@@ -961,13 +991,14 @@ class Krea2SVDQuantCheckpointLoader:
             },
         }
 
-    RETURN_TYPES = ("MODEL", "CLIP", "VAE", "STRING")
-    RETURN_NAMES = ("model", "clip", "vae", "status")
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE", "STRING", "STRING")
+    RETURN_NAMES = ("model", "clip", "vae", "status", "name")
     OUTPUT_TOOLTIPS = ("Wire this to a KSampler.",
                        "Wire this to CLIPTextEncode.",
                        "Wire this to VAEDecode.",
                        "Rank, variant, size and which kernel the quantized layers will "
-                       "actually dispatch to.")
+                       "actually dispatch to.",
+                       "The checkpoint's bare name without folder or extension.")
     OUTPUT_NODE = True
     FUNCTION = "load"
     CATEGORY = _CATEGORY
@@ -976,10 +1007,11 @@ class Krea2SVDQuantCheckpointLoader:
                    "and VAE in a single file. Attaches low-rank SVDQuant branches if present.")
 
     def load(self, ckpt_name, vram_management="auto"):
-        path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+        path = self._resolve_ckpt(ckpt_name)
         patcher, clip, vae, status = load_svdquant_checkpoint(
             path, vram_management=vram_management)
-        return {"ui": {"text": [status]}, "result": (patcher, clip, vae, status)}
+        name = os.path.splitext(ckpt_name.replace("\\", "/").split("/")[-1])[0]
+        return {"ui": {"text": [status]}, "result": (patcher, clip, vae, status, name)}
 
 
 NODE_CLASS_MAPPINGS = {

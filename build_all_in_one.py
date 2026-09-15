@@ -148,6 +148,8 @@ _DTYPE_STR = {
     torch.float8_e4m3fn: "F8_E4M3", torch.float8_e5m2: "F8_E5M2",
 }
 
+_STR_DTYPE = {name: dtype for dtype, name in _DTYPE_STR.items()}
+
 
 class StreamingWriter:
     """A safetensors writer that never holds the whole checkpoint in memory.
@@ -297,9 +299,7 @@ def quantize_text_encoder(path: str, fmt: str, groupsize: int, device: str, writ
 
 
 def _slice_dtype(slice_):
-    return {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16,
-            "I8": torch.int8, "U8": torch.uint8, "I64": torch.int64,
-            "F8_E4M3": torch.float8_e4m3fn}[slice_.get_dtype()]
+    return _STR_DTYPE[slice_.get_dtype()]
 
 
 def _scale_shape(algo: str, out_features: int) -> list[int]:

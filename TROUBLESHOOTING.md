@@ -255,7 +255,7 @@ LoKr plus a txtfusion `.diff`:
 | `adapters = bypass` (default) | 5.21 | the 4-bit weight is never touched, LoKr is exact |
 | `adapters = bake` | 3.55 | ComfyUI rewrites the weight once; the LoKr delta is quantized to 4 bits with it |
 | stock `LoraLoaderModelOnly` for everything | 3.22 | same, and the plain LoRA is requantized too |
-| `tools/bake_adapter.py`, LoKr baked before quantization | 3.74* | no adapter at runtime at all, and the branch is refit around the merged weight |
+| `Scripts/bake_krea2_adapter.py`, LoKr baked before quantization | 3.74* | no adapter at runtime at all, and the branch is refit around the merged weight |
 
 \* that arm still runs one plain LoRA through the exact branch, which is the 0.35 s/step
 between it and the stock row. Baking that one too takes it to the no-LoRA floor of 3.39.
@@ -266,7 +266,7 @@ loader, which is exactly this table times fourteen model calls.
 
 **Which to use.** Occasional LoKr, quality first: leave it on `bypass`. Swapping LoKrs
 constantly: `bake`. Always the same LoKr: bake it into a checkpoint once with
-`tools/bake_adapter.py` -- it adds the delta to the **bf16** weight and then runs the
+`Scripts/bake_krea2_adapter.py` -- it adds the delta to the **bf16** weight and then runs the
 SVDQuant split, so the low-rank branch is fitted against the merged weight instead of the
 LoRA being requantized on top of a finished checkpoint.
 

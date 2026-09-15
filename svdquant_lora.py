@@ -477,7 +477,7 @@ class Krea2SVDQuantLoraLoader:
                 "[krea2-svdquant] %d layer(s) run a per-forward adapter (LoKr/LoHa/OFT). "
                 "That is exact but not free -- measured +1.8 s per model call at 1440x1920. "
                 "Set this node's 'adapters' input to %r for the stock loader's speed, or see "
-                "tools/bake_adapter.py to bake it in with no runtime cost at all.",
+                "Scripts/bake_krea2_adapter.py to bake it in with no runtime cost at all.",
                 len(bypassed), ADAPTER_BAKE)
 
         logging.info("[krea2-svdquant] LoRA stack %s -> %d quantized layers branched "

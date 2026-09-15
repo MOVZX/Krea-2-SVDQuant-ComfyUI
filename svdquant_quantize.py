@@ -48,6 +48,11 @@ def _free_bytes(path: str) -> int:
     return shutil.disk_usage(os.path.dirname(os.path.abspath(path))).free
 
 
+def _allinone_out_dir() -> str:
+    """All-in-one checkpoints land in ComfyUI/output/checkpoints/, never in models/."""
+    return os.path.join(folder_paths.get_output_directory(), "checkpoints")
+
+
 def _outside(dst: str, base_dir: str) -> bool:
     """True if `dst` resolves outside `base_dir`.
 
@@ -359,7 +364,7 @@ class Krea2SVDQuantQuantizeAllInOne:
                 }),
                 "output_name": ("STRING", {
                     "default": "",
-                    "tooltip": "Filename in models/checkpoints/. Leave empty to derive automatically.",
+                    "tooltip": "Filename in ComfyUI/output/checkpoints/. Leave empty to derive automatically.",
                 }),
                 "overwrite": ("BOOLEAN", {
                     "default": False,
@@ -381,7 +386,7 @@ class Krea2SVDQuantQuantizeAllInOne:
     @staticmethod
     def _out_path(output_name, variant, format, rank, te_format) -> str:
         """Where this run will write. Shared, so validation checks the path `run` will use."""
-        ckpt_dir = folder_paths.get_folder_paths("checkpoints")[0]
+        ckpt_dir = _allinone_out_dir()
         if output_name.strip():
             name = output_name.strip()
             if not name.endswith(".safetensors"):
@@ -413,8 +418,8 @@ class Krea2SVDQuantQuantizeAllInOne:
             return str(exc)
 
         dst = cls._out_path(output_name, variant, format, rank, te_format)
-        if _outside(dst, folder_paths.get_folder_paths("checkpoints")[0]):
-            return ("output_name must stay inside the checkpoints folder, got: {}"
+        if _outside(dst, _allinone_out_dir()):
+            return ("output_name must stay inside the output folder, got: {}"
                     .format(output_name))
         if os.path.exists(dst) and not overwrite:
             return ("{} already exists. Enable 'overwrite', or set a different output_name."
@@ -440,7 +445,7 @@ class Krea2SVDQuantQuantizeAllInOne:
     CATEGORY = _CATEGORY
     TITLE = "Krea2 SVDQuant Quantize All-in-One"
     DESCRIPTION = ("Bakes DiT, 4-bit quantized Qwen3-VL 4B text encoder, and VAE into a single "
-                   "combined checkpoint in ComfyUI/models/checkpoints/ (~12 GB instead of 15.5 GB "
+                   "combined checkpoint in ComfyUI/output/checkpoints/ (~12 GB instead of 15.5 GB "
                    "across three files).")
 
     def run(self, source_dit, text_encoder, vae, format, te_format, rank, refine_iters,
@@ -457,11 +462,11 @@ class Krea2SVDQuantQuantizeAllInOne:
 
         fmt, rank = resolve_format(format, rank, rank_was_set=False)
 
-        os.makedirs(folder_paths.get_folder_paths("checkpoints")[0], exist_ok=True)
+        os.makedirs(_allinone_out_dir(), exist_ok=True)
         dst = self._out_path(output_name, variant, format, rank, te_format)
 
-        if _outside(dst, folder_paths.get_folder_paths("checkpoints")[0]):
-            raise RuntimeError("output_name must stay inside the checkpoints folder, "
+        if _outside(dst, _allinone_out_dir()):
+            raise RuntimeError("output_name must stay inside the output folder, "
                                "got: {}".format(output_name))
 
         if os.path.exists(dst) and not overwrite:
@@ -505,9 +510,9 @@ class Krea2SVDQuantQuantizeAllInOne:
                                               "svdq_act_stats", stats_path)
                 if not os.path.isfile(stats_path):
                     raise RuntimeError("act_stats file not found: {}".format(stats_path))
-            # ComfyUI's temp directory rather than models/checkpoints/: a run killed
+            # ComfyUI's temp directory rather than output/checkpoints/: a run killed
             # mid-quantize leaves this ~8 GB file behind -- the `finally` below only covers
-            # a clean unwind -- and beside the real checkpoints it shows up in every loader
+            # a clean unwind -- and inside the model tree it shows up in every loader
             # dropdown as something that looks loadable and is not.
             temp_dir = folder_paths.get_temp_directory()
             os.makedirs(temp_dir, exist_ok=True)
