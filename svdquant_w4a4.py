@@ -950,7 +950,11 @@ class Krea2SVDQuantCheckpointLoader:
             for f in sorted(os.listdir(out_dir)):
                 if f.endswith(".safetensors"):
                     paths.append(os.path.join(out_dir, f))
-        paths += folder_paths.get_full_paths("checkpoints")
+        for base in folder_paths.get_folder_paths("checkpoints"):
+            for root, _dirs, files in os.walk(base):
+                for f in sorted(files):
+                    if f.endswith(".safetensors"):
+                        paths.append(os.path.join(root, f))
         return paths
 
     @classmethod
