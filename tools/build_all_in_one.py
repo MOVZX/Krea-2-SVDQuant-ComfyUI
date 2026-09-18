@@ -22,7 +22,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from build_all_in_one import TE_FORMATS, build_all_in_one_checkpoint  # noqa: E402
-from quantize_krea2 import DEFAULT_SEED, REFINE_TOL, resolve_format  # noqa: E402
+from quantize_krea2 import DEFAULT_SEED, REFINE_TOL, _find_comfyui_root, resolve_format  # noqa: E402
 
 
 def main():
@@ -47,7 +47,9 @@ def main():
     ap.add_argument("--variant", choices=["turbo", "base", "unknown"], default="unknown")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--out", default=None,
+                    help="output path (default: <ComfyUI>/output/checkpoints/, matching "
+                         "the in-graph All-in-One node)")
     ap.add_argument("--keep-dit-temp", action="store_true",
                     help="do not delete the intermediate quantized diffusion file")
     ap.add_argument("--dry-run", action="store_true",
@@ -69,10 +71,14 @@ def main():
         stem = "Krea2-{}".format(args.variant.capitalize()) if args.variant != "unknown" \
             else "Krea2"
         tag = "SVDQuant-W4A4-rank{}".format(rank) if rank else args.format.upper()
-        dit_dir = os.path.dirname(os.path.abspath(args.dit))
-        ckpt_dir = os.path.join(os.path.dirname(dit_dir), "checkpoints")
-        target_dir = ckpt_dir if os.path.isdir(ckpt_dir) else dit_dir
-        out = os.path.join(target_dir,
+        root = _find_comfyui_root()
+        # The in-graph node writes output/checkpoints/, never models/. The ComfyUI-less
+        # fallback keeps the old models/ location: outside an install there is no output/
+        # to mean.
+        ckpt_dir = os.path.join(root, "output", "checkpoints") if root else \
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(args.dit))), "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        out = os.path.join(ckpt_dir,
                            "{}-AllInOne-{}-TE{}.safetensors".format(
                                stem, tag, args.te_format.upper()))
 

@@ -125,7 +125,8 @@ class Krea2SVDQuantQuantize:
                 }),
                 "output_name": ("STRING", {
                     "default": "",
-                    "tooltip": "Filename inside models/diffusion_models/. Leave empty to "
+                    "tooltip": "Filename inside ComfyUI/output/diffusion_models/ (svdq/svdq8 "
+                               "builds land in its SVDQuant/ subfolder). Leave empty to "
                                "derive it from the source model name and format.",
                 }),
                 "overwrite": ("BOOLEAN", {
