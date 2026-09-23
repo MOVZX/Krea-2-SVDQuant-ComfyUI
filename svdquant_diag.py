@@ -3,10 +3,10 @@
 Answers the questions a performance or OOM report needs answered before anything
 else can be said:
 
-* which comfy_kitchen backend ``convrot_w4a4_linear`` actually dispatches to on this
-  machine -- ``cuda`` is the int4 tensor-core kernel, ``eager`` is a pure-PyTorch
-  int4-unpack-then-bf16-matmul that is *slower* than plain bf16;
-* how ComfyUI's memory accounting sees the model, and where the weights currently live.
+* which acceleration path each quantized layer's matmul runs on -- W4A4 on the
+  int4 tensor cores, W4A8 and stock INT8 on the int8 tensor cores, Triton as
+  a software emulation, and plain bf16 matmul (eager) as the unpack-and-matmul
+  fallback that is *slower* than fp8;
 
 The first one matters more than it looks: ComfyUI disables comfy_kitchen's CUDA backend
 outright when torch was built against CUDA < 13 (``comfy/quant_ops.py``), which silently
@@ -67,6 +67,39 @@ _DEFAULT_TOKENS = (1024 // 16) * (1024 // 16)
 
 _FUNC = "convrot_w4a4_linear"
 _W4A8_FUNC = "w4a8_int8_linear"
+_INT8_FUNC = "int8_tensorwise"
+# Human-readable names for the acceleration paths the matmuls run on. These are
+# what the loader, the env check, and the diagnostics reports print: plain
+# English first, the machine name kept in parentheses for bug reports.
+# The mapping matches the installed comfy_kitchen registry: W4A4 matmuls run on
+# the int4 tensor cores, W4A8 matmuls on the int8 tensor cores (the 4-bit weight
+# is expanded to int8 for the MMA), and the Triton backend implements the same
+# matmul in software. Stock int8_tensorwise checkpoints are not in the registry
+# at all -- ComfyUI routes them through torch._int_mm, which needs
+# supports_int8_compute().
+_PATH_NAMES = {
+    (_FUNC, "cuda"): "INT4 cores (convrot_w4a4)",
+    (_FUNC, "eager"): "plain bf16 matmul (eager)",
+    (_FUNC, "triton"): "Triton emulation (triton)",
+    (_W4A8_FUNC, "cuda"): "INT8 cores (w4a8_int8)",
+    (_W4A8_FUNC, "eager"): "plain bf16 matmul (eager)",
+    (_W4A8_FUNC, "triton"): "Triton emulation (triton)",
+}
+_INT8_PATH = "INT8 cores (int8_tensorwise)"
+
+
+def _known_kitchen_op(func: str | None) -> bool:
+    return func in (_FUNC, _W4A8_FUNC)
+
+
+def acceleration_path(func: str | None, backend: str | None) -> str:
+    """The plain-English name of the matmul path that will run."""
+    if func == _INT8_FUNC:
+        return _INT8_PATH if mm.supports_int8_compute() else "plain bf16 matmul"
+    if not _known_kitchen_op(func):
+        return "no acceleration path"
+    return _PATH_NAMES.get((func, backend or ""), "no acceleration path")
+
 
 # One category for every node in this pack. Under `advanced/loaders` they were scattered
 # among ComfyUI's own dozen-plus loaders; class names are what saved workflows match on, so
@@ -222,13 +255,23 @@ def dispatch_warning(backend: str | None, failures: dict, func: str = _FUNC) -> 
         return None
 
     cuda_reason = (failures or {}).get("cuda", "unknown")
+    path = acceleration_path(func, backend)
     lines = [
-        "[krea2-svdquant] WARNING: {} will dispatch to the '{}' backend, not "
-        "'cuda'.".format(func, backend or "<none>"),
-        "  The non-CUDA path dequantizes the weights in Python and runs an ordinary matmul, "
-        "so this checkpoint will be SLOWER than fp8 or even plain bf16.",
+        "[krea2-svdquant] WARNING: this checkpoint will run on {}, not the "
+        "tensor-core path.".format(path),
+        "  The fast tensor-core path is not in use, so this checkpoint runs "
+        "slower than it should.",
         "  cuda backend was rejected because: {}".format(cuda_reason),
     ]
+    if backend == "eager":
+        lines.append(
+            "  The eager path unpacks the quantized weights back to bf16 and runs "
+            "an ordinary matmul. It is slower than fp8, and can be slower than "
+            "plain bf16.")
+    elif backend == "triton":
+        lines.append(
+            "  The Triton path runs a software emulation of the matmul on the GPU. "
+            "It has no dedicated tensor-core path.")
 
     cuda_build = torch.version.cuda
     if cuda_build is None or tuple(int(p) for p in str(cuda_build).split(".")[:1]) < (13,):
@@ -305,8 +348,8 @@ def log_dispatch(diffusion_model) -> str:
             logging.warning("[krea2-svdquant] could not resolve a %s backend: %s",
                             func, failures)
             return "could not resolve a {} backend: {}".format(func, failures)
-        logging.info("[krea2-svdquant] %s dispatch backend: %s (%s)",
-                     func, backend, impl_path)
+        path = acceleration_path(func, backend)
+        logging.info("[krea2-svdquant] Using %s", path)
         warning = dispatch_warning(backend, failures, func)
         if warning:
             logging.warning("%s", warning)
@@ -318,7 +361,7 @@ def log_dispatch(diffusion_model) -> str:
         if arch:
             logging.warning("%s", arch)
         return "\n".join(x for x in (
-            "{} dispatch backend: {} ({})".format(func, backend, impl_path),
+            "Using {} ({})".format(path, impl_path),
             warning, arch) if x)
     except Exception:
         # A diagnostic must never be the reason a model fails to load.
@@ -343,19 +386,76 @@ def report_backend_status() -> str:
         lines.append("comfy_kitchen unavailable: {}".format(_CK_IMPORT_ERROR))
         return "\n".join(lines)
 
-    for name, info in sorted(ck_registry.list_backends().items()):
-        lines.append("{:<8} available={:<5} disabled={:<5} implements {}={} {}={} reason={}".format(
-            name, str(info["available"]), str(info["disabled"]),
-            _FUNC, str(_FUNC in info["capabilities"]),
-            _W4A8_FUNC, str(_W4A8_FUNC in info["capabilities"]),
-            info["unavailable_reason"] or "-"))
+def acceleration_paths_table() -> list[str]:
+    """Plain-English status for each acceleration path.
 
-    active = [n for n, i in ck_registry.list_backends().items()
-              if i["available"] and not i["disabled"]
-              and (_FUNC in i["capabilities"] or _W4A8_FUNC in i["capabilities"])]
+    Shared by the env check (no model loaded) and the diagnostics dispatch report
+    (model loaded), so both say the same thing for the same machine. The labels
+    mirror `_PATH_NAMES` -- the same names the loader prints on every load.
+    """
+    if ck_registry is None:
+        return []
+    backends = ck_registry.list_backends()
+
+    def _live(backend: str, funcs: tuple[str, ...]) -> bool:
+        info = backends.get(backend)
+        if info is None:
+            return False
+        return info["available"] and not info["disabled"] and any(f in info["capabilities"] for f in funcs)
+
+    rows = [
+        ("INT4 cores (convrot_w4a4)",
+         "live" if _live("cuda", (_FUNC,)) else "off",
+         "W4A4 / SVDQuant",
+         "the matmul runs on the int4 tensor cores"),
+        ("INT8 cores (w4a8_int8)",
+         "live" if _live("cuda", (_W4A8_FUNC,)) else "off",
+         "W4A8 / SVDQuant8",
+         "the matmul runs on the int8 tensor cores"),
+        ("INT8 cores (int8_tensorwise)",
+         "live" if mm.supports_int8_compute() else "off",
+         "stock INT8",
+         "the matmul runs on the int8 tensor cores (torch._int_mm)"),
+        ("Triton emulation (triton)",
+         "live" if _live("triton", (_FUNC, _W4A8_FUNC)) else "off",
+         "W4A4 / W4A8",
+         "the matmul runs in software, no tensor cores"),
+        ("plain bf16 matmul (eager)", "always available", "all",
+         "weights are unpacked to bf16, then an ordinary matmul"),
+    ]
+    lines = ["{:24} {:15} {:17} what it does".format("path", "status", "applies to")]
+    for path, status, applies, what in rows:
+        lines.append("{:24} {:15} {:17} {}".format(path, status, applies, what))
+    return lines
+
+
+def report_backend_status() -> str:
+    """The part of the dispatch story that needs no model loaded.
+
+    Answers "is the int4 tensor-core kernel even available on this install?" -- worth being
+    able to ask *before* downloading an 8 GB checkpoint, which is why both `diagnose.py
+    --no-load` and the env-check node come through here.
+    """
+    lines = ["torch {}  (cuda build {})".format(torch.__version__, torch.version.cuda), ""]
+    if _QUANT_OPS_ERROR:
+        lines.append("comfy.quant_ops failed to import: {}".format(_QUANT_OPS_ERROR))
+        lines.append("No quantized checkpoint can load on this build, and this repo's "
+                     "quantizer has no formats available. Update ComfyUI.")
+        lines.append("")
+    if ck_registry is None:
+        lines.append("comfy_kitchen unavailable: {}".format(_CK_IMPORT_ERROR))
+        return "\n".join(lines)
+
+    lines.extend(acceleration_paths_table())
+
+    backends = ck_registry.list_backends()
+    active = [n for n, i in backends.items()
+             if i["available"] and not i["disabled"]
+             and (_FUNC in i["capabilities"] or _W4A8_FUNC in i["capabilities"])]
     lines.append("")
     if "cuda" in active:
-        lines.append("cuda backend is live -- the tensor-core kernels are available.")
+        lines.append("The tensor-core paths are live. W4A4 runs on INT4 cores, "
+                     "W4A8 and stock INT8 run on INT8 cores.")
         # "Available" is not "fast" on pre-Ampere for the int4 path, and this report is
         # the one people read before downloading 8 GB.
         arch = architecture_note()
@@ -364,9 +464,8 @@ def report_backend_status() -> str:
             lines.append(arch)
     else:
         lines.append(
-            "cuda backend is NOT live. quantized layers will fall back to {}, which "
-            "dequantizes the weights in Python -- expect the checkpoint to be slower "
-            "than fp8.".format(active or "nothing"))
+            "The tensor-core paths are NOT live. Quantized layers will fall back to "
+            "{} -- expect the checkpoint to be slower than fp8.".format(active or "nothing"))
         cuda_build = torch.version.cuda
         if cuda_build is None or int(str(cuda_build).split(".")[0]) < 13:
             lines.append(
@@ -472,18 +571,8 @@ def _distinct_shapes(diffusion_model):
 
 
 def report_dispatch(patcher, tokens: int) -> list[str]:
-    lines = ["== comfy_kitchen backends =="]
-    if ck_registry is None:
-        lines.append("comfy_kitchen unavailable: {}".format(_CK_IMPORT_ERROR))
-        return lines
-
-    for name, info in sorted(ck_registry.list_backends().items()):
-        lines.append("{:<8} available={:<5} disabled={:<5} reason={}".format(
-            name, str(info["available"]), str(info["disabled"]),
-            info["unavailable_reason"] or "-"))
-        lines.append("         implements {}={}, {}={}".format(
-            _FUNC, _FUNC in info["capabilities"],
-            _W4A8_FUNC, _W4A8_FUNC in info["capabilities"]))
+    lines = ["== acceleration paths =="]
+    lines.extend(acceleration_paths_table())
 
     lines.append("")
     lines.append("== dispatch per weight shape (tokens={}) ==".format(tokens))
@@ -495,8 +584,8 @@ def report_dispatch(patcher, tokens: int) -> list[str]:
     for shape, (name, module) in sorted(shapes.items()):
         backend, impl_path, failures = resolve_dispatch(module, tokens)
         lines.append("{}  [{} -> {}]".format(name, shape[1], shape[0]))
+        lines.append("    path    : {}".format(acceleration_path(_probe_op(module), backend)))
         lines.append("    backend : {}".format(backend or "NONE"))
-        lines.append("    impl    : {}".format(impl_path or "-"))
         if backend != "cuda":
             for bname, reason in sorted(failures.items()):
                 lines.append("    rejected {}: {}".format(bname, reason))
@@ -778,9 +867,9 @@ class Krea2SVDQuantDiagnostics:
     FUNCTION = "run"
     CATEGORY = _CATEGORY
     TITLE = "Krea2 SVDQuant Diagnostics"
-    DESCRIPTION = ("Passthrough node that reports which comfy_kitchen backend the "
-                   "quantized layers dispatch to, plus memory accounting and timings. "
-                   "Paste the output into bug reports.")
+    DESCRIPTION = ("Passthrough node that reports which acceleration path the "
+                   "quantized layers' matmuls run on, plus memory accounting and "
+                   "timings. Paste the output into bug reports.")
 
     def run(self, model, mode, tokens):
         try:
@@ -818,9 +907,9 @@ class Krea2SVDQuantEnvCheck:
     FUNCTION = "run"
     CATEGORY = _CATEGORY
     TITLE = "Krea2 SVDQuant Env Check"
-    DESCRIPTION = ("Is the int4 tensor-core kernel available on this install? Needs no model "
-                   "and no checkpoint - run it before downloading one. If it says the cuda "
-                   "backend is not live, quantized checkpoints will be slower than fp8.")
+    DESCRIPTION = ("Which acceleration paths are available on this install -- "
+                   "INT4 cores, INT8 cores, Triton, or only plain bf16 -- "
+                   "with no model loaded, so you can ask before downloading one.")
 
     def run(self):
         try:
