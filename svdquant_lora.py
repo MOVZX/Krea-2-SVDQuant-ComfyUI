@@ -333,6 +333,10 @@ def collect_svdquant_lora(patcher, lora_sd, strength: float, quant_layers: set[s
 
     return applied, patched_normally, dequantizing
 
+def _bare_name(name: str) -> str:
+    """`Krea-2/AAA.safetensors` -> `AAA`: no folder, no extension."""
+    return os.path.splitext(name.replace("\\", "/").split("/")[-1])[0]
+
 
 class Krea2SVDQuantLoraLoader:
     @classmethod
@@ -370,9 +374,10 @@ class Krea2SVDQuantLoraLoader:
             },
         }
 
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    OUTPUT_TOOLTIPS = ("The model with the LoRA attached as a parallel branch.",)
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "name")
+    OUTPUT_TOOLTIPS = ("The model with the LoRA attached as a parallel branch.",
+                       "The LoRA's bare name without folder or extension.")
     FUNCTION = "load_lora"
     CATEGORY = _CATEGORY
     TITLE = "Krea2 SVDQuant LoRA Loader"
@@ -385,7 +390,7 @@ class Krea2SVDQuantLoraLoader:
 
     def load_lora(self, model, lora_name, strength, adapters=ADAPTER_BYPASS):
         if strength == 0:
-            return (model,)
+            return (model, _bare_name(lora_name))
         patcher = model.clone()
 
         # Re-apply the whole stack from scratch rather than appending to whatever the
@@ -486,7 +491,7 @@ class Krea2SVDQuantLoraLoader:
                      len(bypassed), lora_name, quantized, normal,
                      " (no-low-rank checkpoint: {} quantized layers carry no svdq branch)"
                      .format(unbranched) if unbranched else "")
-        return (patcher,)
+        return (patcher, _bare_name(lora_name))
 
 
 NODE_CLASS_MAPPINGS = {"Krea2SVDQuantLoraLoader": Krea2SVDQuantLoraLoader}

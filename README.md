@@ -174,7 +174,7 @@ Installing this adds nine nodes, all under **Krea2/SVDQuant**:
 |---|---|
 | **Krea2 SVDQuant W4A4 Loader** | Loads standalone `svdq` DiT diffusion models |
 | **Krea2 SVDQuant Checkpoint Loader** | Loads unified **All-in-One** checkpoints (DiT + 4-bit Qwen3-VL 4B TE + VAE) |
-| **Krea2 SVDQuant LoRA Loader** | LoRAs, LoKrs, and LoHas on quantized blocks — supports `bypass`, `svd delta`, and `bake` modes |
+| **Krea2 SVDQuant LoRA Loader** | LoRAs, LoKrs, and LoHas on quantized blocks — `bypass`, `svd delta`, `bake` modes; outputs the LoRA's bare name as a STRING |
 | **Krea2 SVDQuant Quantize** | Builds a quantized DiT checkpoint without leaving ComfyUI |
 | **Krea2 SVDQuant Quantize All-in-One** | Bakes DiT, 4-bit text encoder, and VAE into a unified ~12 GB checkpoint directly from ComfyUI |
 | **Krea2 SVDQuant Diagnostics** | Backend dispatch, memory accounting, per-layer timings, profiler table |

@@ -15,7 +15,7 @@
       "format": "svdq",
       "te_format": "w4a4",
       "rank": 64,
-      "refine_iters": 100,
+      "refine_iters": 10000,
       "groupsize": 256,
       "variant": "turbo",
       "output_name": "",

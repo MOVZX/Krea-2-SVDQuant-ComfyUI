@@ -91,6 +91,10 @@ it — which discards the format and quantizes the LoRA delta to 4 bits along wi
 node attaches the LoRA as a parallel branch instead: `(W + BA)x == Wx + B(Ax)` is exact for a
 linear layer, and the quantized weight is never touched.
 
+**The `name` output** is the LoRA's bare name (no folder, no extension) — wire it to any
+STRING input, or to `PreviewAny`, to tag your images with the LoRA you ran. The checkpoint
+loaders do the same with `status` and `name`.
+
 **If a LoRA seems to do nothing, read the console.** The node prints what it matched:
 
 ```

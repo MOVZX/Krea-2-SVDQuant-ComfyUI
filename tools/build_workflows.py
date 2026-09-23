@@ -536,12 +536,12 @@ def build_lora():
                 size=[400, 80])
 
     lora1 = g.add("Krea2SVDQuantLoraLoader", 2, 0, inputs=[("model", "MODEL")],
-                  outputs=[("model", "MODEL")],
+                  outputs=[("model", "MODEL"), ("name", "STRING")],
                   widgets=[("lora_name", "your_krea2_lora.safetensors"), ("strength", 1.0),
                            ("adapters", ADAPTER_BYPASS)],
                   title="Krea2 SVDQuant LoRA Loader", colour=ORANGE, size=[400, 140])
     lora2 = g.add("Krea2SVDQuantLoraLoader", 2, 1, inputs=[("model", "MODEL")],
-                  outputs=[("model", "MODEL")],
+                  outputs=[("model", "MODEL"), ("name", "STRING")],
                   widgets=[("lora_name", "your_krea2_lora.safetensors"), ("strength", 0.6),
                            ("adapters", ADAPTER_BYPASS)],
                   title="Second LoRA (muted - ctrl-B to enable)", colour=ORANGE,
